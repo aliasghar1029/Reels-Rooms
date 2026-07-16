@@ -1,0 +1,863 @@
+// =====================================================================
+// Reel Room — app.js
+// All data lives in the signed-in user's own Google Drive:
+//   /Reel Room Data/reel-room-data.json   (pages, ideas, prompts)
+//   /Reel Room Data/media/<file>          (thumbnails & videos)
+// The app only ever touches files it created (drive.file scope).
+// =====================================================================
+
+// ---------------------------------------------------------------
+// THEME (light / dark) — persisted, both premium
+// ---------------------------------------------------------------
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  const btn = document.getElementById("theme-toggle-btn");
+  if (btn) btn.textContent = theme === "light" ? "☀️" : "🌙";
+  try { localStorage.setItem("rr_theme", theme); } catch (e) {}
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const current = document.documentElement.getAttribute("data-theme") || "dark";
+  applyTheme(current);
+  const toggleBtn = document.getElementById("theme-toggle-btn");
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", () => {
+      const now = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+      applyTheme(now);
+    });
+  }
+});
+
+// ---------------------------------------------------------------
+// GENERIC PROMPT / CONFIRM MODAL — replaces native browser popups
+// ---------------------------------------------------------------
+function showPrompt({ title, placeholder = "", defaultValue = "", confirmLabel = "Save" }) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById("generic-modal");
+    const input = document.getElementById("generic-modal-input");
+    const msg = document.getElementById("generic-modal-message");
+    const confirmBtn = document.getElementById("generic-modal-confirm");
+    const cancelBtn = document.getElementById("generic-modal-cancel");
+
+    document.getElementById("generic-modal-title").textContent = title;
+    msg.hidden = true;
+    input.hidden = false;
+    input.placeholder = placeholder;
+    input.value = defaultValue;
+    confirmBtn.textContent = confirmLabel;
+    confirmBtn.classList.remove("btn-danger-solid");
+    modal.hidden = false;
+    setTimeout(() => { input.focus(); input.select(); }, 60);
+
+    function cleanup() {
+      modal.hidden = true;
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onKey);
+    }
+    function onConfirm() { const v = input.value.trim(); cleanup(); resolve(v || null); }
+    function onCancel() { cleanup(); resolve(null); }
+    function onKey(e) { if (e.key === "Enter") onConfirm(); if (e.key === "Escape") onCancel(); }
+
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+    input.addEventListener("keydown", onKey);
+  });
+}
+
+function showConfirm({ title, message, danger = false, confirmLabel }) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById("generic-modal");
+    const input = document.getElementById("generic-modal-input");
+    const msg = document.getElementById("generic-modal-message");
+    const confirmBtn = document.getElementById("generic-modal-confirm");
+    const cancelBtn = document.getElementById("generic-modal-cancel");
+
+    document.getElementById("generic-modal-title").textContent = title;
+    msg.textContent = message;
+    msg.hidden = false;
+    input.hidden = true;
+    confirmBtn.textContent = confirmLabel || (danger ? "Delete" : "Confirm");
+    confirmBtn.classList.toggle("btn-danger-solid", danger);
+    modal.hidden = false;
+
+    function cleanup() {
+      modal.hidden = true;
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      confirmBtn.classList.remove("btn-danger-solid");
+    }
+    function onConfirm() { cleanup(); resolve(true); }
+    function onCancel() { cleanup(); resolve(false); }
+
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+  });
+}
+
+const DRIVE_FILES = "https://www.googleapis.com/drive/v3/files";
+const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files";
+
+const state = {
+  tokenClient: null,
+  accessToken: null,
+  folderId: null,
+  pendingFolderId: null,
+  uploadedFolderId: null,
+  dataFileId: null,
+  data: { pages: [] },
+  currentPageId: null,
+  currentTab: "ideas",
+  saveTimer: null,
+  blobCache: new Map(),
+};
+
+// ---------------------------------------------------------------
+// AUTH
+// ---------------------------------------------------------------
+window.addEventListener("load", () => {
+  if (!window.google || !google.accounts) {
+    toast("Google sign-in script failed to load. Check your connection.", "error");
+    return;
+  }
+  state.tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CONFIG.CLIENT_ID,
+    scope: CONFIG.DRIVE_SCOPE,
+    callback: onTokenReceived,
+  });
+
+  document.getElementById("google-signin-btn").addEventListener("click", () => {
+    state.isSilentAttempt = false;
+    state.tokenClient.requestAccessToken({ prompt: "consent" });
+  });
+
+  // Try a silent re-login if the browser remembers this Google session.
+  // Uses localStorage (not sessionStorage) so this works even after the
+  // browser was fully closed and reopened, not just within one tab.
+  if (localStorage.getItem("rr_logged_in") === "1") {
+    state.isSilentAttempt = true;
+    state.tokenClient.requestAccessToken({ prompt: "" });
+  }
+});
+
+async function onTokenReceived(resp) {
+  if (resp.error) {
+    // A failed silent attempt just means: show the normal login screen,
+    // no need to alarm the user with an error toast.
+    if (!state.isSilentAttempt) toast("Sign-in failed: " + resp.error, "error");
+    return;
+  }
+  state.accessToken = resp.access_token;
+  localStorage.setItem("rr_logged_in", "1");
+  document.getElementById("login-screen").hidden = true;
+  document.getElementById("app").hidden = false;
+  await fetchAccountInfo();
+  await bootstrapDrive();
+}
+
+async function fetchAccountInfo() {
+  try {
+    const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+      headers: { Authorization: `Bearer ${state.accessToken}` },
+    });
+    const info = await r.json();
+    document.getElementById("account-name").textContent = info.name || info.email || "Signed in";
+    if (info.picture) document.getElementById("account-avatar").src = info.picture;
+  } catch (e) { /* non-critical */ }
+}
+
+document.getElementById("signout-btn").addEventListener("click", () => {
+  if (state.accessToken) google.accounts.oauth2.revoke(state.accessToken, () => {});
+  localStorage.removeItem("rr_logged_in");
+  location.reload();
+});
+
+// ---------------------------------------------------------------
+// DRIVE BOOTSTRAP
+// ---------------------------------------------------------------
+async function bootstrapDrive() {
+  setDriveStatus("Connecting to Drive…");
+  try {
+    state.folderId = await findOrCreateFolder(CONFIG.APP_FOLDER_NAME, "root");
+    state.pendingFolderId = await findOrCreateFolder("Pending Reels", state.folderId);
+    state.uploadedFolderId = await findOrCreateFolder("Uploaded Reels", state.folderId);
+    state.dataFileId = await findOrCreateDataFile();
+    state.data = await loadData();
+    if (!Array.isArray(state.data.pages)) state.data.pages = [];
+    setDriveStatus("Synced ✓");
+    renderPageList();
+    renderCurrentView();
+  } catch (e) {
+    console.error(e);
+    setDriveStatus("Drive connection failed", true);
+    toast("Could not reach Google Drive. Try refreshing.", "error");
+  }
+}
+
+function setDriveStatus(text, isError) {
+  const el = document.getElementById("drive-status");
+  el.textContent = text;
+  el.classList.toggle("err", !!isError);
+}
+
+async function driveFetch(url, options = {}) {
+  const res = await fetch(url, {
+    ...options,
+    headers: { Authorization: `Bearer ${state.accessToken}`, ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Drive API ${res.status}: ${body}`);
+  }
+  return res;
+}
+
+async function findOrCreateFolder(name, parentId) {
+  const q = encodeURIComponent(
+    `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`
+  );
+  const res = await driveFetch(`${DRIVE_FILES}?q=${q}&fields=files(id,name)`);
+  const json = await res.json();
+  if (json.files && json.files.length) return json.files[0].id;
+
+  const createRes = await driveFetch(DRIVE_FILES, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, mimeType: "application/vnd.google-apps.folder", parents: [parentId] }),
+  });
+  const created = await createRes.json();
+  return created.id;
+}
+
+async function findOrCreateDataFile() {
+  const q = encodeURIComponent(
+    `name='${CONFIG.DATA_FILE_NAME}' and '${state.folderId}' in parents and trashed=false`
+  );
+  const res = await driveFetch(`${DRIVE_FILES}?q=${q}&fields=files(id,name)`);
+  const json = await res.json();
+  if (json.files && json.files.length) return json.files[0].id;
+
+  const metadata = { name: CONFIG.DATA_FILE_NAME, parents: [state.folderId], mimeType: "application/json" };
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("file", new Blob([JSON.stringify({ pages: [] })], { type: "application/json" }));
+  const createRes = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id`, {
+    method: "POST",
+    body: form,
+  });
+  const created = await createRes.json();
+  return created.id;
+}
+
+async function loadData() {
+  const res = await driveFetch(`${DRIVE_FILES}/${state.dataFileId}?alt=media`);
+  return await res.json();
+}
+
+function queueSave() {
+  setDriveStatus("Saving…");
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(saveDataNow, 700);
+}
+
+async function saveDataNow() {
+  try {
+    await driveFetch(`${DRIVE_UPLOAD}/${state.dataFileId}?uploadType=media`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state.data),
+    });
+    setDriveStatus("Synced ✓");
+  } catch (e) {
+    console.error(e);
+    setDriveStatus("Save failed — retrying…", true);
+    state.saveTimer = setTimeout(saveDataNow, 3000);
+  }
+}
+
+async function uploadMedia(file, folderId) {
+  const metadata = { name: `${Date.now()}_${file.name}`, parents: [folderId] };
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("file", file);
+  const res = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id,webViewLink,mimeType`, {
+    method: "POST",
+    body: form,
+  });
+  return await res.json(); // {id, webViewLink, mimeType}
+}
+
+async function moveFileBetweenFolders(fileId, fromFolderId, toFolderId) {
+  if (!fileId) return;
+  try {
+    await driveFetch(
+      `${DRIVE_FILES}/${fileId}?addParents=${toFolderId}&removeParents=${fromFolderId}&fields=id,parents`,
+      { method: "PATCH" }
+    );
+  } catch (e) {
+    console.error("Could not move file in Drive:", e);
+  }
+}
+
+async function moveIdeaMedia(idea, toUploaded) {
+  const from = toUploaded ? state.pendingFolderId : state.uploadedFolderId;
+  const to = toUploaded ? state.uploadedFolderId : state.pendingFolderId;
+  await Promise.all([
+    moveFileBetweenFolders(idea.thumbFileId, from, to),
+    moveFileBetweenFolders(idea.videoFileId, from, to),
+  ]);
+}
+
+async function deleteFile(fileId) {
+  if (!fileId) return;
+  try { await driveFetch(`${DRIVE_FILES}/${fileId}`, { method: "DELETE" }); } catch (e) { /* ignore */ }
+}
+
+async function getImageBlobUrl(fileId) {
+  if (state.blobCache.has(fileId)) return state.blobCache.get(fileId);
+  const res = await driveFetch(`${DRIVE_FILES}/${fileId}?alt=media`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  state.blobCache.set(fileId, url);
+  return url;
+}
+
+// ---------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------
+function uid() {
+  return (crypto.randomUUID ? crypto.randomUUID() : "id-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+}
+function codePrefix(name) {
+  const letters = name.replace(/[^a-zA-Z]/g, "").toUpperCase();
+  return (letters.slice(0, 2) || "PG");
+}
+function currentPage() {
+  return state.data.pages.find((p) => p.id === state.currentPageId) || null;
+}
+function toast(msg, type) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = "toast" + (type ? " " + type : "");
+  el.hidden = false;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => (el.hidden = true), 3200);
+}
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---------------------------------------------------------------
+// PAGE LIST / SIDEBAR
+// ---------------------------------------------------------------
+document.getElementById("add-page-btn").addEventListener("click", async () => {
+  const name = await showPrompt({ title: "Name this Facebook page", placeholder: "e.g. Crash Craze", confirmLabel: "Add page" });
+  if (!name) return;
+  const page = {
+    id: uid(),
+    name: name.trim(),
+    codePrefix: codePrefix(name.trim()),
+    masterPrompt: "",
+    ideaCounter: 0,
+    ideas: [],
+    customTables: [],
+  };
+  state.data.pages.push(page);
+  state.currentPageId = page.id;
+  queueSave();
+  renderPageList();
+  renderCurrentView();
+});
+
+function renderPageList() {
+  const wrap = document.getElementById("page-list");
+  wrap.innerHTML = "";
+  state.data.pages.forEach((page) => {
+    const div = document.createElement("div");
+    div.className = "page-card" + (page.id === state.currentPageId ? " active" : "");
+    const pending = page.ideas.filter((i) => !i.uploaded).length;
+    div.innerHTML = `
+      <div class="page-avatar">${escapeHtml(page.name.slice(0, 2).toUpperCase())}</div>
+      <div class="page-card-info">
+        <div class="page-card-name">${escapeHtml(page.name)}</div>
+        <div class="page-card-meta">${pending} pending</div>
+      </div>`;
+    div.addEventListener("click", () => {
+      state.currentPageId = page.id;
+      renderPageList();
+      renderCurrentView();
+      document.getElementById("sidebar").classList.remove("open");
+    });
+    wrap.appendChild(div);
+  });
+}
+
+document.getElementById("sidebar-toggle").addEventListener("click", () => {
+  document.getElementById("sidebar").classList.toggle("open");
+});
+
+document.getElementById("rename-page-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const name = await showPrompt({ title: "Rename page", defaultValue: page.name, confirmLabel: "Save" });
+  if (!name) return;
+  page.name = name;
+  queueSave();
+  renderPageList();
+  renderCurrentView();
+});
+
+document.getElementById("delete-page-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const ok = await showConfirm({
+    title: "Delete this page?",
+    message: `"${page.name}" and all its ideas will be permanently deleted. This can't be undone.`,
+    danger: true,
+  });
+  if (!ok) return;
+  state.data.pages = state.data.pages.filter((p) => p.id !== page.id);
+  state.currentPageId = null;
+  queueSave();
+  renderPageList();
+  renderCurrentView();
+});
+
+// ---------------------------------------------------------------
+// TABS
+// ---------------------------------------------------------------
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    state.currentTab = btn.dataset.tab;
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".tab-panel").forEach((p) => (p.hidden = true));
+    document.getElementById("tab-" + btn.dataset.tab).hidden = false;
+    if (btn.dataset.tab === "uploaded") renderUploadedTable();
+    if (btn.dataset.tab === "tables") renderCustomTables();
+  });
+});
+
+// ---------------------------------------------------------------
+// MAIN RENDER
+// ---------------------------------------------------------------
+function renderCurrentView() {
+  const page = currentPage();
+  document.getElementById("empty-state").hidden = !!page;
+  document.getElementById("page-view").hidden = !page;
+  if (!page) return;
+
+  document.getElementById("page-title-display").textContent = page.name;
+  document.getElementById("master-prompt-input").value = page.masterPrompt || "";
+  if (!page.customTables) page.customTables = [];
+  renderIdeasTable();
+  renderUploadedTable();
+  renderCustomTables();
+}
+
+function renderIdeasTable() {
+  const page = currentPage();
+  const tbody = document.getElementById("ideas-tbody");
+  tbody.innerHTML = "";
+  const pending = page.ideas.filter((i) => !i.uploaded);
+  document.getElementById("ideas-count").textContent = `${pending.length} idea${pending.length === 1 ? "" : "s"}`;
+  document.getElementById("ideas-empty").hidden = pending.length > 0;
+
+  pending.forEach((idea) => tbody.appendChild(buildIdeaRow(idea, page, false)));
+}
+
+function renderUploadedTable() {
+  const page = currentPage();
+  if (!page) return;
+  const tbody = document.getElementById("uploaded-tbody");
+  tbody.innerHTML = "";
+  const done = page.ideas.filter((i) => i.uploaded);
+  document.getElementById("uploaded-empty").hidden = done.length > 0;
+  done.forEach((idea) => tbody.appendChild(buildIdeaRow(idea, page, true)));
+}
+
+function buildIdeaRow(idea, page, isUploadedView) {
+  const tr = document.createElement("tr");
+  if (idea.uploaded) tr.classList.add("done");
+
+  const thumbCell = idea.thumbFileId
+    ? `<img class="thumb-thumbnail" data-thumb-id="${idea.thumbFileId}" alt="thumbnail">`
+    : `<div class="thumb-placeholder"></div>`;
+
+  const videoCell = idea.videoFileId
+    ? `<a class="video-link" href="${idea.videoLink || "#"}" target="_blank" rel="noopener">▶ Open</a>`
+    : `<span class="video-none">—</span>`;
+
+  tr.innerHTML = `
+    <td><span class="idea-code">${page.codePrefix}-${String(idea.code).padStart(3, "0")}</span></td>
+    <td class="idea-title">${escapeHtml(idea.title)}</td>
+    <td class="idea-desc" title="${escapeHtml(idea.description)}">${escapeHtml(idea.description) || "—"}</td>
+    <td class="idea-tags">${escapeHtml(idea.hashtags) || "—"}</td>
+    <td class="idea-date">${idea.date || "—"}</td>
+    <td>${thumbCell}</td>
+    <td>${videoCell}</td>
+    ${isUploadedView ? "" : `<td class="col-done"><input type="checkbox" class="check-toggle" ${idea.uploaded ? "checked" : ""}></td>`}
+    <td class="row-actions">
+      <button class="icon-btn edit-btn" title="Edit">✎</button>
+      <button class="icon-btn danger del-btn" title="Delete">🗑</button>
+    </td>`;
+
+  const img = tr.querySelector("[data-thumb-id]");
+  if (img) {
+    getImageBlobUrl(idea.thumbFileId).then((url) => (img.src = url)).catch(() => {});
+  }
+
+  const checkbox = tr.querySelector(".check-toggle");
+  if (checkbox) {
+    checkbox.addEventListener("change", async () => {
+      const newVal = checkbox.checked;
+      idea.uploaded = newVal;
+      idea.uploadedAt = newVal ? new Date().toISOString().slice(0, 10) : null;
+      queueSave();
+      renderIdeasTable();
+      renderUploadedTable();
+      renderPageList();
+      if (idea.thumbFileId || idea.videoFileId) {
+        setDriveStatus("Moving files in Drive…");
+        await moveIdeaMedia(idea, newVal);
+        setDriveStatus("Synced ✓");
+      }
+    });
+  }
+
+  tr.querySelector(".edit-btn").addEventListener("click", () => openIdeaModal(idea));
+  tr.querySelector(".del-btn").addEventListener("click", async () => {
+    const ok = await showConfirm({ title: "Delete this idea?", message: `"${idea.title}" will be permanently removed, along with its thumbnail and video.`, danger: true });
+    if (!ok) return;
+    await deleteFile(idea.thumbFileId);
+    await deleteFile(idea.videoFileId);
+    page.ideas = page.ideas.filter((i) => i.id !== idea.id);
+    queueSave();
+    renderIdeasTable();
+    renderUploadedTable();
+    renderPageList();
+  });
+
+  return tr;
+}
+
+// ---------------------------------------------------------------
+// MASTER PROMPT
+// ---------------------------------------------------------------
+document.getElementById("save-master-btn").addEventListener("click", () => {
+  const page = currentPage();
+  if (!page) return;
+  page.masterPrompt = document.getElementById("master-prompt-input").value;
+  queueSave();
+  const tag = document.getElementById("master-saved-tag");
+  tag.hidden = false;
+  setTimeout(() => (tag.hidden = true), 2000);
+});
+
+// ---------------------------------------------------------------
+// IDEA MODAL (add / edit)
+// ---------------------------------------------------------------
+let editingIdeaId = null;
+let pendingThumbFile = null;
+let pendingVideoFile = null;
+
+document.getElementById("add-idea-btn").addEventListener("click", () => openIdeaModal(null));
+document.getElementById("modal-cancel").addEventListener("click", closeIdeaModal);
+
+function openIdeaModal(idea) {
+  editingIdeaId = idea ? idea.id : null;
+  pendingThumbFile = null;
+  pendingVideoFile = null;
+  document.getElementById("modal-title").textContent = idea ? "Edit idea" : "New idea";
+  document.getElementById("f-title").value = idea ? idea.title : "";
+  document.getElementById("f-desc").value = idea ? idea.description : "";
+  document.getElementById("f-hashtags").value = idea ? idea.hashtags : "";
+  document.getElementById("f-date").value = idea ? idea.date || "" : "";
+  document.getElementById("f-thumb").value = "";
+  document.getElementById("f-video").value = "";
+  document.getElementById("upload-progress").hidden = true;
+
+  const thumbPrev = document.getElementById("thumb-preview");
+  const videoPrev = document.getElementById("video-preview");
+  thumbPrev.hidden = true;
+  videoPrev.hidden = true;
+  if (idea && idea.thumbFileId) {
+    getImageBlobUrl(idea.thumbFileId).then((url) => {
+      thumbPrev.innerHTML = `<img src="${url}"><div class="file-name">Current thumbnail (choose a file to replace)</div>`;
+      thumbPrev.hidden = false;
+    });
+  }
+  if (idea && idea.videoFileId) {
+    videoPrev.innerHTML = `<div class="file-name">Current video is saved (choose a file to replace)</div>`;
+    videoPrev.hidden = false;
+  }
+
+  document.getElementById("idea-modal").hidden = false;
+}
+
+function closeIdeaModal() {
+  document.getElementById("idea-modal").hidden = true;
+  editingIdeaId = null;
+}
+
+document.getElementById("f-thumb").addEventListener("change", (e) => {
+  pendingThumbFile = e.target.files[0] || null;
+  const prev = document.getElementById("thumb-preview");
+  if (!pendingThumbFile) { prev.hidden = true; return; }
+  const reader = new FileReader();
+  reader.onload = () => {
+    prev.innerHTML = `<img src="${reader.result}"><div class="file-name">${escapeHtml(pendingThumbFile.name)}</div>`;
+    prev.hidden = false;
+  };
+  reader.readAsDataURL(pendingThumbFile);
+});
+
+document.getElementById("f-video").addEventListener("change", (e) => {
+  pendingVideoFile = e.target.files[0] || null;
+  const prev = document.getElementById("video-preview");
+  if (!pendingVideoFile) { prev.hidden = true; return; }
+  const sizeMb = (pendingVideoFile.size / (1024 * 1024)).toFixed(1);
+  prev.innerHTML = `<div class="file-name">${escapeHtml(pendingVideoFile.name)} (${sizeMb} MB)</div>`;
+  prev.hidden = false;
+});
+
+document.getElementById("modal-save").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const title = document.getElementById("f-title").value.trim();
+  if (!title) { toast("Give the idea a title first.", "error"); return; }
+
+  const progress = document.getElementById("upload-progress");
+  const saveBtn = document.getElementById("modal-save");
+  saveBtn.disabled = true;
+
+  try {
+    let idea = editingIdeaId ? page.ideas.find((i) => i.id === editingIdeaId) : null;
+    const isNew = !idea;
+    if (isNew) {
+      page.ideaCounter += 1;
+      idea = { id: uid(), code: page.ideaCounter, uploaded: false, thumbFileId: null, videoFileId: null, videoLink: null };
+      page.ideas.push(idea);
+    }
+
+    idea.title = title;
+    idea.description = document.getElementById("f-desc").value.trim();
+    idea.hashtags = document.getElementById("f-hashtags").value.trim();
+    idea.date = document.getElementById("f-date").value;
+
+    const targetFolder = idea.uploaded ? state.uploadedFolderId : state.pendingFolderId;
+
+    if (pendingThumbFile) {
+      progress.hidden = false;
+      progress.textContent = "Uploading thumbnail…";
+      if (idea.thumbFileId) await deleteFile(idea.thumbFileId);
+      const uploaded = await uploadMedia(pendingThumbFile, targetFolder);
+      idea.thumbFileId = uploaded.id;
+      state.blobCache.delete(uploaded.id);
+    }
+    if (pendingVideoFile) {
+      progress.hidden = false;
+      progress.textContent = "Uploading video…";
+      if (idea.videoFileId) await deleteFile(idea.videoFileId);
+      const uploaded = await uploadMedia(pendingVideoFile, targetFolder);
+      idea.videoFileId = uploaded.id;
+      idea.videoLink = uploaded.webViewLink;
+    }
+
+    queueSave();
+    closeIdeaModal();
+    renderIdeasTable();
+    renderUploadedTable();
+    renderPageList();
+    toast("Idea saved.", "success");
+  } catch (e) {
+    console.error(e);
+    toast("Something went wrong saving this idea.", "error");
+  } finally {
+    saveBtn.disabled = false;
+    progress.hidden = true;
+  }
+});
+
+// ---------------------------------------------------------------
+// CUSTOM TABLES — fully user-defined headings & content
+// Each row has a "Used" checkbox — ticking it draws a strikethrough
+// through that row's content (mirrors the Ideas -> Uploaded pattern).
+// ---------------------------------------------------------------
+document.getElementById("add-table-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const name = await showPrompt({ title: "Name this table", defaultValue: "Untitled Table", confirmLabel: "Create table" });
+  if (!name) return;
+  if (!page.customTables) page.customTables = [];
+  const table = {
+    id: uid(),
+    name,
+    columns: [
+      { id: uid(), label: "Column 1" },
+      { id: uid(), label: "Column 2" },
+    ],
+    rows: [],
+  };
+  page.customTables.push(table);
+  queueSave();
+  renderCustomTables();
+});
+
+function renderCustomTables() {
+  const page = currentPage();
+  const wrap = document.getElementById("custom-tables-list");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  if (!page) return;
+  if (!page.customTables) page.customTables = [];
+  if (!page.customTables.length) {
+    wrap.innerHTML = `<div class="table-empty">No custom tables yet — click "+ New table" above to build one.</div>`;
+    return;
+  }
+  page.customTables.forEach((table) => wrap.appendChild(buildCustomTableCard(table, page)));
+}
+
+function buildCustomTableCard(table, page) {
+  const card = document.createElement("div");
+  card.className = "custom-table-card";
+
+  const header = document.createElement("div");
+  header.className = "custom-table-header";
+  header.innerHTML = `
+    <input class="custom-table-name" value="${escapeHtml(table.name)}" title="Table name">
+    <div class="custom-table-actions">
+      <button class="btn-ghost add-col-btn">+ Column</button>
+      <button class="btn-ghost add-row-btn">+ Row</button>
+      <button class="icon-btn danger del-table-btn" title="Delete this table">🗑</button>
+    </div>`;
+  card.appendChild(header);
+
+  header.querySelector(".custom-table-name").addEventListener("change", (e) => {
+    table.name = e.target.value.trim() || "Untitled Table";
+    queueSave();
+  });
+  header.querySelector(".add-col-btn").addEventListener("click", async () => {
+    const label = await showPrompt({ title: "New column heading", defaultValue: "New Column", confirmLabel: "Add column" });
+    if (!label) return;
+    const col = { id: uid(), label };
+    table.columns.push(col);
+    table.rows.forEach((r) => (r.cells[col.id] = ""));
+    queueSave();
+    renderCustomTables();
+  });
+  header.querySelector(".add-row-btn").addEventListener("click", () => {
+    const cells = {};
+    table.columns.forEach((c) => (cells[c.id] = ""));
+    table.rows.push({ id: uid(), cells, done: false });
+    queueSave();
+    renderCustomTables();
+  });
+  header.querySelector(".del-table-btn").addEventListener("click", async () => {
+    const ok = await showConfirm({ title: "Delete this table?", message: `"${table.name}" and everything in it will be permanently deleted.`, danger: true });
+    if (!ok) return;
+    page.customTables = page.customTables.filter((t) => t.id !== table.id);
+    queueSave();
+    renderCustomTables();
+  });
+
+  const tableWrap = document.createElement("div");
+  tableWrap.className = "table-wrap";
+  const tableEl = document.createElement("table");
+  tableEl.className = "reel-table custom-table";
+
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  table.columns.forEach((col) => {
+    const th = document.createElement("th");
+    th.innerHTML = `<div class="col-head">
+        <input class="col-label-input" value="${escapeHtml(col.label)}">
+        <button class="col-del-btn" title="Remove this column">×</button>
+      </div>`;
+    th.querySelector(".col-label-input").addEventListener("change", (e) => {
+      col.label = e.target.value.trim() || "Column";
+      queueSave();
+    });
+    th.querySelector(".col-del-btn").addEventListener("click", async () => {
+      if (table.columns.length <= 1) { toast("A table needs at least one column.", "error"); return; }
+      const ok = await showConfirm({ title: "Remove this column?", message: `"${col.label}" will be removed from every row.`, danger: true });
+      if (!ok) return;
+      table.columns = table.columns.filter((c) => c.id !== col.id);
+      table.rows.forEach((r) => delete r.cells[col.id]);
+      queueSave();
+      renderCustomTables();
+    });
+    headRow.appendChild(th);
+  });
+  const usedTh = document.createElement("th");
+  usedTh.className = "col-done";
+  usedTh.textContent = "Used";
+  headRow.appendChild(usedTh);
+  headRow.appendChild(document.createElement("th")).className = "col-actions";
+  thead.appendChild(headRow);
+  tableEl.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  if (!table.rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = table.columns.length + 2;
+    td.className = "table-empty";
+    td.textContent = 'No rows yet — click "+ Row" above to add one.';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  } else {
+    table.rows.forEach((row) => {
+      const tr = document.createElement("tr");
+      if (row.done) tr.classList.add("done");
+
+      table.columns.forEach((col) => {
+        const td = document.createElement("td");
+        const cellInput = document.createElement("textarea");
+        cellInput.className = "cell-input";
+        cellInput.rows = 1;
+        cellInput.value = row.cells[col.id] || "";
+        cellInput.addEventListener("input", () => {
+          cellInput.style.height = "auto";
+          cellInput.style.height = cellInput.scrollHeight + "px";
+        });
+        cellInput.addEventListener("change", (e) => {
+          row.cells[col.id] = e.target.value;
+          queueSave();
+        });
+        td.appendChild(cellInput);
+        tr.appendChild(td);
+      });
+
+      const usedTd = document.createElement("td");
+      usedTd.className = "col-done";
+      const usedCheckbox = document.createElement("input");
+      usedCheckbox.type = "checkbox";
+      usedCheckbox.className = "check-toggle";
+      usedCheckbox.checked = !!row.done;
+      usedCheckbox.addEventListener("change", () => {
+        row.done = usedCheckbox.checked;
+        queueSave();
+        tr.classList.toggle("done", row.done);
+      });
+      usedTd.appendChild(usedCheckbox);
+      tr.appendChild(usedTd);
+
+      const tdActions = document.createElement("td");
+      tdActions.className = "row-actions";
+      tdActions.innerHTML = `<button class="icon-btn danger del-row-btn" title="Delete row">🗑</button>`;
+      tdActions.querySelector(".del-row-btn").addEventListener("click", async () => {
+        const ok = await showConfirm({ title: "Delete this row?", message: "This row will be permanently removed.", danger: true });
+        if (!ok) return;
+        table.rows = table.rows.filter((r) => r.id !== row.id);
+        queueSave();
+        renderCustomTables();
+      });
+      tr.appendChild(tdActions);
+      tbody.appendChild(tr);
+    });
+  }
+  tableEl.appendChild(tbody);
+  tableWrap.appendChild(tableEl);
+  card.appendChild(tableWrap);
+  return card;
+}
