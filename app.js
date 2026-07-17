@@ -99,8 +99,10 @@ const DRIVE_FILES = "https://www.googleapis.com/drive/v3/files";
 const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files";
 
 const state = {
+  authMode: null,       // "google" | "backend"
   tokenClient: null,
-  accessToken: null,
+  accessToken: null,    // used in "google" mode
+  backendJwt: null,     // used in "backend" mode
   folderId: null,
   pendingFolderId: null,
   uploadedFolderId: null,
@@ -113,7 +115,7 @@ const state = {
 };
 
 // ---------------------------------------------------------------
-// AUTH
+// AUTH — Google (direct) mode
 // ---------------------------------------------------------------
 window.addEventListener("load", () => {
   if (!window.google || !google.accounts) {
@@ -131,10 +133,23 @@ window.addEventListener("load", () => {
     state.tokenClient.requestAccessToken({ prompt: "consent" });
   });
 
-  // Try a silent re-login if the browser remembers this Google session.
-  // Uses localStorage (not sessionStorage) so this works even after the
-  // browser was fully closed and reopened, not just within one tab.
-  if (localStorage.getItem("rr_logged_in") === "1") {
+  // Restricted-PC login toggle
+  document.getElementById("show-id-login-btn").addEventListener("click", () => {
+    document.getElementById("id-login-form").hidden = false;
+  });
+  document.getElementById("back-to-google-btn").addEventListener("click", () => {
+    document.getElementById("id-login-form").hidden = true;
+  });
+  document.getElementById("id-login-btn").addEventListener("click", backendLogin);
+
+  // Resume an existing session on reload, whichever mode it was
+  const savedMode = localStorage.getItem("rr_auth_mode");
+  if (savedMode === "backend" && localStorage.getItem("rr_backend_jwt")) {
+    state.authMode = "backend";
+    state.backendJwt = localStorage.getItem("rr_backend_jwt");
+    enterApp();
+  } else if (localStorage.getItem("rr_logged_in") === "1") {
+    // Try a silent re-login if the browser remembers this Google session.
     state.isSilentAttempt = true;
     state.tokenClient.requestAccessToken({ prompt: "" });
   }
@@ -147,12 +162,12 @@ async function onTokenReceived(resp) {
     if (!state.isSilentAttempt) toast("Sign-in failed: " + resp.error, "error");
     return;
   }
+  state.authMode = "google";
   state.accessToken = resp.access_token;
   localStorage.setItem("rr_logged_in", "1");
-  document.getElementById("login-screen").hidden = true;
-  document.getElementById("app").hidden = false;
+  localStorage.setItem("rr_auth_mode", "google");
   await fetchAccountInfo();
-  await bootstrapDrive();
+  enterApp();
 }
 
 async function fetchAccountInfo() {
@@ -166,31 +181,90 @@ async function fetchAccountInfo() {
   } catch (e) { /* non-critical */ }
 }
 
+// ---------------------------------------------------------------
+// AUTH — Backend (ID & Password) mode, for restricted PCs
+// ---------------------------------------------------------------
+async function backendLogin() {
+  const username = document.getElementById("id-username").value.trim();
+  const password = document.getElementById("id-password").value;
+  if (!username || !password) { toast("Enter your username and password.", "error"); return; }
+  if (!CONFIG.BACKEND_URL) { toast("Backend URL is not configured yet.", "error"); return; }
+
+  const btn = document.getElementById("id-login-btn");
+  btn.disabled = true;
+  btn.textContent = "Logging in…";
+  try {
+    const res = await fetch(`${CONFIG.BACKEND_URL}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      toast(body.error || "Login failed.", "error");
+      return;
+    }
+    const body = await res.json();
+    state.authMode = "backend";
+    state.backendJwt = body.token;
+    localStorage.setItem("rr_backend_jwt", body.token);
+    localStorage.setItem("rr_auth_mode", "backend");
+    document.getElementById("account-name").textContent = username;
+    enterApp();
+  } catch (e) {
+    console.error(e);
+    toast("Could not reach the backend. Check the URL and try again.", "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Log in";
+  }
+}
+
+function enterApp() {
+  document.getElementById("login-screen").hidden = true;
+  document.getElementById("app").hidden = false;
+  bootstrapDrive();
+}
+
 document.getElementById("signout-btn").addEventListener("click", () => {
-  if (state.accessToken) google.accounts.oauth2.revoke(state.accessToken, () => {});
+  if (state.authMode === "google" && state.accessToken) {
+    google.accounts.oauth2.revoke(state.accessToken, () => {});
+  }
   localStorage.removeItem("rr_logged_in");
+  localStorage.removeItem("rr_auth_mode");
+  localStorage.removeItem("rr_backend_jwt");
   location.reload();
 });
 
 // ---------------------------------------------------------------
-// DRIVE BOOTSTRAP
+// DRIVE BOOTSTRAP — dispatches to whichever mode is active
 // ---------------------------------------------------------------
 async function bootstrapDrive() {
-  setDriveStatus("Connecting to Drive…");
+  setDriveStatus("Connecting…");
   try {
-    state.folderId = await findOrCreateFolder(CONFIG.APP_FOLDER_NAME, "root");
-    state.pendingFolderId = await findOrCreateFolder("Pending Reels", state.folderId);
-    state.uploadedFolderId = await findOrCreateFolder("Uploaded Reels", state.folderId);
-    state.dataFileId = await findOrCreateDataFile();
-    state.data = await loadData();
+    if (state.authMode === "backend") {
+      const res = await backendFetch("/api/bootstrap");
+      const body = await res.json();
+      state.folderId = body.folderId;
+      state.pendingFolderId = body.pendingFolderId;
+      state.uploadedFolderId = body.uploadedFolderId;
+      state.dataFileId = body.dataFileId;
+      state.data = body.data;
+    } else {
+      state.folderId = await findOrCreateFolder(CONFIG.APP_FOLDER_NAME, "root");
+      state.pendingFolderId = await findOrCreateFolder("Pending Reels", state.folderId);
+      state.uploadedFolderId = await findOrCreateFolder("Uploaded Reels", state.folderId);
+      state.dataFileId = await findOrCreateDataFile();
+      state.data = await loadData();
+    }
     if (!Array.isArray(state.data.pages)) state.data.pages = [];
     setDriveStatus("Synced ✓");
     renderPageList();
     renderCurrentView();
   } catch (e) {
     console.error(e);
-    setDriveStatus("Drive connection failed", true);
-    toast("Could not reach Google Drive. Try refreshing.", "error");
+    setDriveStatus("Connection failed", true);
+    toast("Could not load your data. Try refreshing.", "error");
   }
 }
 
@@ -200,6 +274,25 @@ function setDriveStatus(text, isError) {
   el.classList.toggle("err", !!isError);
 }
 
+// ---------------------------------------------------------------
+// Backend proxy fetch (restricted-PC mode) — talks ONLY to our own
+// server; the browser here never contacts google.com.
+// ---------------------------------------------------------------
+async function backendFetch(path, options = {}) {
+  const res = await fetch(`${CONFIG.BACKEND_URL}${path}`, {
+    ...options,
+    headers: { Authorization: `Bearer ${state.backendJwt}`, ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Backend API ${res.status}: ${body}`);
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------
+// Google Drive direct fetch (Google-login mode)
+// ---------------------------------------------------------------
 async function driveFetch(url, options = {}) {
   const res = await fetch(url, {
     ...options,
@@ -254,6 +347,9 @@ async function loadData() {
   return await res.json();
 }
 
+// ---------------------------------------------------------------
+// SAVE — dispatches to whichever mode is active
+// ---------------------------------------------------------------
 function queueSave() {
   setDriveStatus("Saving…");
   clearTimeout(state.saveTimer);
@@ -262,11 +358,19 @@ function queueSave() {
 
 async function saveDataNow() {
   try {
-    await driveFetch(`${DRIVE_UPLOAD}/${state.dataFileId}?uploadType=media`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.data),
-    });
+    if (state.authMode === "backend") {
+      await backendFetch("/api/data", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state.data),
+      });
+    } else {
+      await driveFetch(`${DRIVE_UPLOAD}/${state.dataFileId}?uploadType=media`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state.data),
+      });
+    }
     setDriveStatus("Synced ✓");
   } catch (e) {
     console.error(e);
@@ -275,16 +379,28 @@ async function saveDataNow() {
   }
 }
 
-async function uploadMedia(file, folderId) {
+// ---------------------------------------------------------------
+// MEDIA — upload / move / delete / preview, dispatched by mode
+// isUploadedTarget: true = goes to "Uploaded Reels", false = "Pending Reels"
+// ---------------------------------------------------------------
+async function uploadMedia(file, isUploadedTarget) {
+  if (state.authMode === "backend") {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("target", isUploadedTarget ? "uploaded" : "pending");
+    const res = await backendFetch("/api/upload", { method: "POST", body: form });
+    return await res.json();
+  }
+  const folderId = isUploadedTarget ? state.uploadedFolderId : state.pendingFolderId;
   const metadata = { name: `${Date.now()}_${file.name}`, parents: [folderId] };
   const form = new FormData();
   form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   form.append("file", file);
-  const res = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id,webViewLink,mimeType`, {
+  const res = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id,mimeType`, {
     method: "POST",
     body: form,
   });
-  return await res.json(); // {id, webViewLink, mimeType}
+  return await res.json(); // {id, mimeType}
 }
 
 async function moveFileBetweenFolders(fileId, fromFolderId, toFolderId) {
@@ -300,6 +416,19 @@ async function moveFileBetweenFolders(fileId, fromFolderId, toFolderId) {
 }
 
 async function moveIdeaMedia(idea, toUploaded) {
+  if (state.authMode === "backend") {
+    for (const fileId of [idea.thumbFileId, idea.videoFileId]) {
+      if (!fileId) continue;
+      try {
+        await backendFetch("/api/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileId, toUploaded }),
+        });
+      } catch (e) { console.error(e); }
+    }
+    return;
+  }
   const from = toUploaded ? state.pendingFolderId : state.uploadedFolderId;
   const to = toUploaded ? state.uploadedFolderId : state.pendingFolderId;
   await Promise.all([
@@ -310,12 +439,20 @@ async function moveIdeaMedia(idea, toUploaded) {
 
 async function deleteFile(fileId) {
   if (!fileId) return;
-  try { await driveFetch(`${DRIVE_FILES}/${fileId}`, { method: "DELETE" }); } catch (e) { /* ignore */ }
+  try {
+    if (state.authMode === "backend") {
+      await backendFetch(`/api/file/${fileId}`, { method: "DELETE" });
+    } else {
+      await driveFetch(`${DRIVE_FILES}/${fileId}`, { method: "DELETE" });
+    }
+  } catch (e) { /* ignore */ }
 }
 
 async function getImageBlobUrl(fileId) {
   if (state.blobCache.has(fileId)) return state.blobCache.get(fileId);
-  const res = await driveFetch(`${DRIVE_FILES}/${fileId}?alt=media`);
+  const res = state.authMode === "backend"
+    ? await backendFetch(`/api/file/${fileId}`)
+    : await driveFetch(`${DRIVE_FILES}/${fileId}?alt=media`);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   state.blobCache.set(fileId, url);
@@ -335,6 +472,24 @@ function codePrefix(name) {
 function currentPage() {
   return state.data.pages.find((p) => p.id === state.currentPageId) || null;
 }
+async function showVideoPreview(fileId) {
+  try {
+    const url = await getImageBlobUrl(fileId);
+    document.getElementById("video-modal-player").src = url;
+    document.getElementById("video-modal").hidden = false;
+  } catch (e) {
+    console.error(e);
+    toast("Could not load this video.", "error");
+  }
+}
+
+document.getElementById("video-modal-close").addEventListener("click", () => {
+  const player = document.getElementById("video-modal-player");
+  player.pause();
+  player.src = "";
+  document.getElementById("video-modal").hidden = true;
+});
+
 function toast(msg, type) {
   const el = document.getElementById("toast");
   el.textContent = msg;
@@ -484,7 +639,7 @@ function buildIdeaRow(idea, page, isUploadedView) {
     : `<div class="thumb-placeholder"></div>`;
 
   const videoCell = idea.videoFileId
-    ? `<a class="video-link" href="${idea.videoLink || "#"}" target="_blank" rel="noopener">▶ Open</a>`
+    ? `<button type="button" class="video-link video-preview-btn" data-video-id="${idea.videoFileId}">▶ Preview</button>`
     : `<span class="video-none">—</span>`;
 
   tr.innerHTML = `
@@ -504,6 +659,11 @@ function buildIdeaRow(idea, page, isUploadedView) {
   const img = tr.querySelector("[data-thumb-id]");
   if (img) {
     getImageBlobUrl(idea.thumbFileId).then((url) => (img.src = url)).catch(() => {});
+  }
+
+  const videoBtn = tr.querySelector("[data-video-id]");
+  if (videoBtn) {
+    videoBtn.addEventListener("click", () => showVideoPreview(idea.videoFileId));
   }
 
   const checkbox = tr.querySelector(".check-toggle");
@@ -644,13 +804,11 @@ document.getElementById("modal-save").addEventListener("click", async () => {
     idea.hashtags = document.getElementById("f-hashtags").value.trim();
     idea.date = document.getElementById("f-date").value;
 
-    const targetFolder = idea.uploaded ? state.uploadedFolderId : state.pendingFolderId;
-
     if (pendingThumbFile) {
       progress.hidden = false;
       progress.textContent = "Uploading thumbnail…";
       if (idea.thumbFileId) await deleteFile(idea.thumbFileId);
-      const uploaded = await uploadMedia(pendingThumbFile, targetFolder);
+      const uploaded = await uploadMedia(pendingThumbFile, idea.uploaded);
       idea.thumbFileId = uploaded.id;
       state.blobCache.delete(uploaded.id);
     }
@@ -658,9 +816,9 @@ document.getElementById("modal-save").addEventListener("click", async () => {
       progress.hidden = false;
       progress.textContent = "Uploading video…";
       if (idea.videoFileId) await deleteFile(idea.videoFileId);
-      const uploaded = await uploadMedia(pendingVideoFile, targetFolder);
+      const uploaded = await uploadMedia(pendingVideoFile, idea.uploaded);
       idea.videoFileId = uploaded.id;
-      idea.videoLink = uploaded.webViewLink;
+      state.blobCache.delete(uploaded.id);
     }
 
     queueSave();
