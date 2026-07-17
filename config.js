@@ -15,4 +15,6 @@ const CONFIG = {
   // Name of the folder this app creates inside your Drive
   APP_FOLDER_NAME: "Reel Room Data",
   DATA_FILE_NAME: "reel-room-data.json"
+
+  BACKEND_URL: "https://admin00000011.pythonanywhere.com"
 };
