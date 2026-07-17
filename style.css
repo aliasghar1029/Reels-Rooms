@@ -178,6 +178,26 @@ input,textarea{ font-family:inherit; }
 }
 .login-hint{ margin-top:22px; font-size:12px; line-height:1.6; color:var(--text-dim); }
 
+.link-btn{
+  background:none; border:none; color:var(--gold);
+  font-size:12.5px; font-weight:600; margin-top:14px;
+  text-align:center; width:100%;
+}
+.link-btn:hover{ color:var(--gold-bright); text-decoration:underline; }
+
+.id-login-form{ margin-top:16px; text-align:left; }
+.id-login-form label{ display:block; font-size:12px; font-weight:700; color:var(--gold-bright); letter-spacing:0.3px; text-transform:uppercase; margin:12px 0 6px; }
+.id-login-form input{
+  width:100%; border:1px solid var(--line); border-radius:8px; padding:10px 12px;
+  font-size:13.5px; background:var(--bg); color:var(--text);
+}
+.id-login-form input:focus{ border-color:var(--gold-deep); }
+
+.video-modal-card{ max-width:640px; padding:20px; }
+.video-modal-header{ display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }
+.video-modal-header h3{ font-size:17px; }
+#video-modal-player{ width:100%; max-height:70vh; border-radius:10px; background:#000; display:block; }
+
 /* ===================== APP SHELL ===================== */
 .app{ display:flex; min-height:100vh; }
 
