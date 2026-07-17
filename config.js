@@ -14,7 +14,8 @@ const CONFIG = {
 
   // Name of the folder this app creates inside your Drive
   APP_FOLDER_NAME: "Reel Room Data",
-  DATA_FILE_NAME: "reel-room-data.json"
+  DATA_FILE_NAME: "reel-room-data.json",
 
+  // Only needed for the "Login with ID & Password" mode (restricted PCs).
   BACKEND_URL: "https://admin00000011.pythonanywhere.com"
 };
