@@ -1,0 +1,13 @@
+import os
+
+os.environ['APP_USERS_JSON'] = '''{"yourusername": {"password_hash": "...", "refresh_token": "..."}}'''
+os.environ['GOOGLE_CLIENT_ID'] = 'your-client-id.apps.googleusercontent.com'
+os.environ['GOOGLE_CLIENT_SECRET'] = 'your-google-client-secret'
+os.environ['JWT_SECRET'] = 'any-long-random-string'
+os.environ['ALLOWED_ORIGIN'] = 'https://yourusername.github.io'
+
+os.environ['FACEBOOK_APP_ID'] = 'your-facebook-app-id'
+os.environ['FACEBOOK_APP_SECRET'] = 'your-facebook-app-secret'
+os.environ['FACEBOOK_REDIRECT_URI'] = 'https://yourusername.pythonanywhere.com/api/facebook/callback'
+
+os.environ['SCHEDULER_SECRET'] = 'another-long-random-string'

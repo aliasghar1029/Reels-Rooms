@@ -99,6 +99,7 @@
         <button class="tab-btn" data-tab="master">Master Prompt</button>
         <button class="tab-btn" data-tab="uploaded">Uploaded Reels</button>
         <button class="tab-btn" data-tab="tables">Custom Tables</button>
+        <button class="tab-btn" data-tab="automation">Automation</button>
       </nav>
 
       <!-- IDEAS TAB -->
@@ -116,6 +117,7 @@
                 <th class="col-desc">Description</th>
                 <th>Tags</th>
                 <th>Date</th>
+                <th>Time</th>
                 <th>Thumb</th>
                 <th>Video</th>
                 <th class="col-done">Uploaded</th>
@@ -150,6 +152,7 @@
                 <th class="col-desc">Description</th>
                 <th>Tags</th>
                 <th>Date</th>
+                <th>Time</th>
                 <th>Thumb</th>
                 <th>Video</th>
                 <th class="col-actions"></th>
@@ -168,6 +171,29 @@
           <button id="add-table-btn" class="btn-primary">+ New table</button>
         </div>
         <div id="custom-tables-list" class="custom-tables-list"></div>
+      </section>
+
+      <!-- AUTOMATION TAB — link a real Facebook Page, auto-publish on schedule -->
+      <section id="tab-automation" class="tab-panel" hidden>
+        <div id="automation-locked" class="master-panel" hidden>
+          <label>Automation needs backend login</label>
+          <p class="field-hint">
+            Auto-publishing runs on a schedule, in the background — that only works through
+            the ID &amp; Password login mode. Sign out and log back in with
+            "Login with ID &amp; Password instead" to set this up.
+          </p>
+        </div>
+        <div id="automation-panel" class="master-panel" hidden>
+          <label>Facebook Page connection</label>
+          <p id="automation-status" class="field-hint">Checking…</p>
+          <button id="fb-connect-btn" class="btn-primary">Connect Facebook Page</button>
+          <button id="fb-unlink-btn" class="btn-ghost btn-danger" hidden>Disconnect</button>
+          <p class="field-hint" style="margin-top:18px;">
+            Once connected, any idea whose <strong>Scheduled date</strong> is today will be
+            posted automatically as a Reel (if it has a video) or a photo post (if it only
+            has a thumbnail) — once a day, no manual work needed.
+          </p>
+        </div>
       </section>
     </div>
   </main>
@@ -189,6 +215,10 @@
 
     <label for="f-date">Scheduled date</label>
     <input id="f-date" type="date">
+
+    <label for="f-time">Scheduled time</label>
+    <input id="f-time" type="time">
+    <p class="field-hint" style="margin-top:4px;">Used by auto-publish — posts within ~30 minutes of this time.</p>
 
     <div class="field-row">
       <div class="field-col">

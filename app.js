@@ -589,6 +589,7 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
     document.getElementById("tab-" + btn.dataset.tab).hidden = false;
     if (btn.dataset.tab === "uploaded") renderUploadedTable();
     if (btn.dataset.tab === "tables") renderCustomTables();
+    if (btn.dataset.tab === "automation") renderAutomationTab();
   });
 });
 
@@ -648,10 +649,12 @@ function buildIdeaRow(idea, page, isUploadedView) {
     <td class="idea-desc" title="${escapeHtml(idea.description)}">${escapeHtml(idea.description) || "—"}</td>
     <td class="idea-tags">${escapeHtml(idea.hashtags) || "—"}</td>
     <td class="idea-date">${idea.date || "—"}</td>
+    <td class="idea-date">${idea.time || "—"}</td>
     <td>${thumbCell}</td>
     <td>${videoCell}</td>
     ${isUploadedView ? "" : `<td class="col-done"><input type="checkbox" class="check-toggle" ${idea.uploaded ? "checked" : ""}></td>`}
     <td class="row-actions">
+      ${!isUploadedView && state.authMode === "backend" ? `<button class="icon-btn publish-btn" title="Publish to Facebook now">📤</button>` : ""}
       <button class="icon-btn edit-btn" title="Edit">✎</button>
       <button class="icon-btn danger del-btn" title="Delete">🗑</button>
     </td>`;
@@ -685,6 +688,29 @@ function buildIdeaRow(idea, page, isUploadedView) {
   }
 
   tr.querySelector(".edit-btn").addEventListener("click", () => openIdeaModal(idea));
+
+  const publishBtn = tr.querySelector(".publish-btn");
+  if (publishBtn) {
+    publishBtn.addEventListener("click", async () => {
+      const ok = await showConfirm({ title: "Publish now?", message: `"${idea.title}" will be posted to your linked Facebook Page immediately.` });
+      if (!ok) return;
+      publishBtn.disabled = true;
+      try {
+        await backendFetch("/api/facebook/publish-now", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pageId: page.id, ideaId: idea.id }),
+        });
+        toast("Published to Facebook.", "success");
+        await bootstrapDrive();
+      } catch (e) {
+        console.error(e);
+        toast("Could not publish. Check the Automation tab is connected.", "error");
+      } finally {
+        publishBtn.disabled = false;
+      }
+    });
+  }
   tr.querySelector(".del-btn").addEventListener("click", async () => {
     const ok = await showConfirm({ title: "Delete this idea?", message: `"${idea.title}" will be permanently removed, along with its thumbnail and video.`, danger: true });
     if (!ok) return;
@@ -732,6 +758,7 @@ function openIdeaModal(idea) {
   document.getElementById("f-desc").value = idea ? idea.description : "";
   document.getElementById("f-hashtags").value = idea ? idea.hashtags : "";
   document.getElementById("f-date").value = idea ? idea.date || "" : "";
+  document.getElementById("f-time").value = idea ? idea.time || "" : "";
   document.getElementById("f-thumb").value = "";
   document.getElementById("f-video").value = "";
   document.getElementById("upload-progress").hidden = true;
@@ -803,6 +830,10 @@ document.getElementById("modal-save").addEventListener("click", async () => {
     idea.description = document.getElementById("f-desc").value.trim();
     idea.hashtags = document.getElementById("f-hashtags").value.trim();
     idea.date = document.getElementById("f-date").value;
+<<<<<<< HEAD
+=======
+    idea.time = document.getElementById("f-time").value;
+>>>>>>> d93d5eb (Add Facebook automation backend files)
 
     if (pendingThumbFile) {
       progress.hidden = false;
@@ -1019,3 +1050,78 @@ function buildCustomTableCard(table, page) {
   card.appendChild(tableWrap);
   return card;
 }
+
+// ---------------------------------------------------------------
+// AUTOMATION TAB — link a Facebook Page, show status, connect/disconnect
+// ---------------------------------------------------------------
+async function renderAutomationTab() {
+  const page = currentPage();
+  if (!page) return;
+
+  const locked = document.getElementById("automation-locked");
+  const panel = document.getElementById("automation-panel");
+
+  if (state.authMode !== "backend") {
+    locked.hidden = false;
+    panel.hidden = true;
+    return;
+  }
+  locked.hidden = true;
+  panel.hidden = false;
+
+  const statusEl = document.getElementById("automation-status");
+  const connectBtn = document.getElementById("fb-connect-btn");
+  const unlinkBtn = document.getElementById("fb-unlink-btn");
+  statusEl.textContent = "Checking…";
+  unlinkBtn.hidden = true;
+
+  try {
+    const res = await backendFetch("/api/facebook/status");
+    const links = await res.json();
+    const link = links[page.id];
+    if (link) {
+      statusEl.textContent = `Connected to Facebook Page: "${link.fb_page_name}"`;
+      connectBtn.textContent = "Reconnect / change Page";
+      unlinkBtn.hidden = false;
+    } else {
+      statusEl.textContent = "Not connected yet.";
+      connectBtn.textContent = "Connect Facebook Page";
+    }
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = "Could not check connection status.";
+  }
+}
+
+document.getElementById("fb-connect-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  try {
+    const res = await backendFetch(`/api/facebook/connect-url?pageId=${encodeURIComponent(page.id)}`);
+    const body = await res.json();
+    window.open(body.url, "_blank");
+    toast("Finish connecting in the new tab, then come back and refresh this tab.");
+  } catch (e) {
+    console.error(e);
+    toast("Could not start Facebook connection.", "error");
+  }
+});
+
+document.getElementById("fb-unlink-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const ok = await showConfirm({ title: "Disconnect this Facebook Page?", message: "Automatic publishing for this page will stop until you reconnect." });
+  if (!ok) return;
+  try {
+    await backendFetch("/api/facebook/unlink", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pageId: page.id }),
+    });
+    toast("Disconnected.", "success");
+    renderAutomationTab();
+  } catch (e) {
+    console.error(e);
+    toast("Could not disconnect.", "error");
+  }
+});
