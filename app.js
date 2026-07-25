@@ -830,10 +830,7 @@ document.getElementById("modal-save").addEventListener("click", async () => {
     idea.description = document.getElementById("f-desc").value.trim();
     idea.hashtags = document.getElementById("f-hashtags").value.trim();
     idea.date = document.getElementById("f-date").value;
-<<<<<<< HEAD
-=======
     idea.time = document.getElementById("f-time").value;
->>>>>>> d93d5eb (Add Facebook automation backend files)
 
     if (pendingThumbFile) {
       progress.hidden = false;
