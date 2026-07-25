@@ -1,1124 +1,275 @@
-// =====================================================================
-// Reel Room — app.js
-// All data lives in the signed-in user's own Google Drive:
-//   /Reel Room Data/reel-room-data.json   (pages, ideas, prompts)
-//   /Reel Room Data/media/<file>          (thumbnails & videos)
-// The app only ever touches files it created (drive.file scope).
-// =====================================================================
-
-// ---------------------------------------------------------------
-// THEME (light / dark) — persisted, both premium
-// ---------------------------------------------------------------
-function applyTheme(theme) {
-  document.documentElement.setAttribute("data-theme", theme);
-  const btn = document.getElementById("theme-toggle-btn");
-  if (btn) btn.textContent = theme === "light" ? "☀️" : "🌙";
-  try { localStorage.setItem("rr_theme", theme); } catch (e) {}
-}
-
-document.addEventListener("DOMContentLoaded", () => {
-  const current = document.documentElement.getAttribute("data-theme") || "dark";
-  applyTheme(current);
-  const toggleBtn = document.getElementById("theme-toggle-btn");
-  if (toggleBtn) {
-    toggleBtn.addEventListener("click", () => {
-      const now = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
-      applyTheme(now);
-    });
-  }
-});
-
-// ---------------------------------------------------------------
-// GENERIC PROMPT / CONFIRM MODAL — replaces native browser popups
-// ---------------------------------------------------------------
-function showPrompt({ title, placeholder = "", defaultValue = "", confirmLabel = "Save" }) {
-  return new Promise((resolve) => {
-    const modal = document.getElementById("generic-modal");
-    const input = document.getElementById("generic-modal-input");
-    const msg = document.getElementById("generic-modal-message");
-    const confirmBtn = document.getElementById("generic-modal-confirm");
-    const cancelBtn = document.getElementById("generic-modal-cancel");
-
-    document.getElementById("generic-modal-title").textContent = title;
-    msg.hidden = true;
-    input.hidden = false;
-    input.placeholder = placeholder;
-    input.value = defaultValue;
-    confirmBtn.textContent = confirmLabel;
-    confirmBtn.classList.remove("btn-danger-solid");
-    modal.hidden = false;
-    setTimeout(() => { input.focus(); input.select(); }, 60);
-
-    function cleanup() {
-      modal.hidden = true;
-      confirmBtn.removeEventListener("click", onConfirm);
-      cancelBtn.removeEventListener("click", onCancel);
-      input.removeEventListener("keydown", onKey);
-    }
-    function onConfirm() { const v = input.value.trim(); cleanup(); resolve(v || null); }
-    function onCancel() { cleanup(); resolve(null); }
-    function onKey(e) { if (e.key === "Enter") onConfirm(); if (e.key === "Escape") onCancel(); }
-
-    confirmBtn.addEventListener("click", onConfirm);
-    cancelBtn.addEventListener("click", onCancel);
-    input.addEventListener("keydown", onKey);
-  });
-}
-
-function showConfirm({ title, message, danger = false, confirmLabel }) {
-  return new Promise((resolve) => {
-    const modal = document.getElementById("generic-modal");
-    const input = document.getElementById("generic-modal-input");
-    const msg = document.getElementById("generic-modal-message");
-    const confirmBtn = document.getElementById("generic-modal-confirm");
-    const cancelBtn = document.getElementById("generic-modal-cancel");
-
-    document.getElementById("generic-modal-title").textContent = title;
-    msg.textContent = message;
-    msg.hidden = false;
-    input.hidden = true;
-    confirmBtn.textContent = confirmLabel || (danger ? "Delete" : "Confirm");
-    confirmBtn.classList.toggle("btn-danger-solid", danger);
-    modal.hidden = false;
-
-    function cleanup() {
-      modal.hidden = true;
-      confirmBtn.removeEventListener("click", onConfirm);
-      cancelBtn.removeEventListener("click", onCancel);
-      confirmBtn.classList.remove("btn-danger-solid");
-    }
-    function onConfirm() { cleanup(); resolve(true); }
-    function onCancel() { cleanup(); resolve(false); }
-
-    confirmBtn.addEventListener("click", onConfirm);
-    cancelBtn.addEventListener("click", onCancel);
-  });
-}
-
-const DRIVE_FILES = "https://www.googleapis.com/drive/v3/files";
-const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files";
-
-const state = {
-  authMode: null,       // "google" | "backend"
-  tokenClient: null,
-  accessToken: null,    // used in "google" mode
-  backendJwt: null,     // used in "backend" mode
-  folderId: null,
-  pendingFolderId: null,
-  uploadedFolderId: null,
-  dataFileId: null,
-  data: { pages: [] },
-  currentPageId: null,
-  currentTab: "ideas",
-  saveTimer: null,
-  blobCache: new Map(),
-};
-
-// ---------------------------------------------------------------
-// AUTH — Google (direct) mode
-// ---------------------------------------------------------------
-window.addEventListener("load", () => {
-  if (!window.google || !google.accounts) {
-    toast("Google sign-in script failed to load. Check your connection.", "error");
-    return;
-  }
-  state.tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: CONFIG.CLIENT_ID,
-    scope: CONFIG.DRIVE_SCOPE,
-    callback: onTokenReceived,
-  });
-
-  document.getElementById("google-signin-btn").addEventListener("click", () => {
-    state.isSilentAttempt = false;
-    state.tokenClient.requestAccessToken({ prompt: "consent" });
-  });
-
-  // Restricted-PC login toggle
-  document.getElementById("show-id-login-btn").addEventListener("click", () => {
-    document.getElementById("id-login-form").hidden = false;
-  });
-  document.getElementById("back-to-google-btn").addEventListener("click", () => {
-    document.getElementById("id-login-form").hidden = true;
-  });
-  document.getElementById("id-login-btn").addEventListener("click", backendLogin);
-
-  // Resume an existing session on reload, whichever mode it was
-  const savedMode = localStorage.getItem("rr_auth_mode");
-  if (savedMode === "backend" && localStorage.getItem("rr_backend_jwt")) {
-    state.authMode = "backend";
-    state.backendJwt = localStorage.getItem("rr_backend_jwt");
-    enterApp();
-  } else if (localStorage.getItem("rr_logged_in") === "1") {
-    // Try a silent re-login if the browser remembers this Google session.
-    state.isSilentAttempt = true;
-    state.tokenClient.requestAccessToken({ prompt: "" });
-  }
-});
-
-async function onTokenReceived(resp) {
-  if (resp.error) {
-    // A failed silent attempt just means: show the normal login screen,
-    // no need to alarm the user with an error toast.
-    if (!state.isSilentAttempt) toast("Sign-in failed: " + resp.error, "error");
-    return;
-  }
-  state.authMode = "google";
-  state.accessToken = resp.access_token;
-  localStorage.setItem("rr_logged_in", "1");
-  localStorage.setItem("rr_auth_mode", "google");
-  await fetchAccountInfo();
-  enterApp();
-}
-
-async function fetchAccountInfo() {
-  try {
-    const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-      headers: { Authorization: `Bearer ${state.accessToken}` },
-    });
-    const info = await r.json();
-    document.getElementById("account-name").textContent = info.name || info.email || "Signed in";
-    if (info.picture) document.getElementById("account-avatar").src = info.picture;
-  } catch (e) { /* non-critical */ }
-}
-
-// ---------------------------------------------------------------
-// AUTH — Backend (ID & Password) mode, for restricted PCs
-// ---------------------------------------------------------------
-async function backendLogin() {
-  const username = document.getElementById("id-username").value.trim();
-  const password = document.getElementById("id-password").value;
-  if (!username || !password) { toast("Enter your username and password.", "error"); return; }
-  if (!CONFIG.BACKEND_URL) { toast("Backend URL is not configured yet.", "error"); return; }
-
-  const btn = document.getElementById("id-login-btn");
-  btn.disabled = true;
-  btn.textContent = "Logging in…";
-  try {
-    const res = await fetch(`${CONFIG.BACKEND_URL}/api/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      toast(body.error || "Login failed.", "error");
-      return;
-    }
-    const body = await res.json();
-    state.authMode = "backend";
-    state.backendJwt = body.token;
-    localStorage.setItem("rr_backend_jwt", body.token);
-    localStorage.setItem("rr_auth_mode", "backend");
-    document.getElementById("account-name").textContent = username;
-    enterApp();
-  } catch (e) {
-    console.error(e);
-    toast("Could not reach the backend. Check the URL and try again.", "error");
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Log in";
-  }
-}
-
-function enterApp() {
-  document.getElementById("login-screen").hidden = true;
-  document.getElementById("app").hidden = false;
-  bootstrapDrive();
-}
-
-document.getElementById("signout-btn").addEventListener("click", () => {
-  if (state.authMode === "google" && state.accessToken) {
-    google.accounts.oauth2.revoke(state.accessToken, () => {});
-  }
-  localStorage.removeItem("rr_logged_in");
-  localStorage.removeItem("rr_auth_mode");
-  localStorage.removeItem("rr_backend_jwt");
-  location.reload();
-});
-
-// ---------------------------------------------------------------
-// DRIVE BOOTSTRAP — dispatches to whichever mode is active
-// ---------------------------------------------------------------
-async function bootstrapDrive() {
-  setDriveStatus("Connecting…");
-  try {
-    if (state.authMode === "backend") {
-      const res = await backendFetch("/api/bootstrap");
-      const body = await res.json();
-      state.folderId = body.folderId;
-      state.pendingFolderId = body.pendingFolderId;
-      state.uploadedFolderId = body.uploadedFolderId;
-      state.dataFileId = body.dataFileId;
-      state.data = body.data;
-    } else {
-      state.folderId = await findOrCreateFolder(CONFIG.APP_FOLDER_NAME, "root");
-      state.pendingFolderId = await findOrCreateFolder("Pending Reels", state.folderId);
-      state.uploadedFolderId = await findOrCreateFolder("Uploaded Reels", state.folderId);
-      state.dataFileId = await findOrCreateDataFile();
-      state.data = await loadData();
-    }
-    if (!Array.isArray(state.data.pages)) state.data.pages = [];
-    setDriveStatus("Synced ✓");
-    renderPageList();
-    renderCurrentView();
-  } catch (e) {
-    console.error(e);
-    setDriveStatus("Connection failed", true);
-    toast("Could not load your data. Try refreshing.", "error");
-  }
-}
-
-function setDriveStatus(text, isError) {
-  const el = document.getElementById("drive-status");
-  el.textContent = text;
-  el.classList.toggle("err", !!isError);
-}
-
-// ---------------------------------------------------------------
-// Backend proxy fetch (restricted-PC mode) — talks ONLY to our own
-// server; the browser here never contacts google.com.
-// ---------------------------------------------------------------
-async function backendFetch(path, options = {}) {
-  const res = await fetch(`${CONFIG.BACKEND_URL}${path}`, {
-    ...options,
-    headers: { Authorization: `Bearer ${state.backendJwt}`, ...(options.headers || {}) },
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Backend API ${res.status}: ${body}`);
-  }
-  return res;
-}
-
-// ---------------------------------------------------------------
-// Google Drive direct fetch (Google-login mode)
-// ---------------------------------------------------------------
-async function driveFetch(url, options = {}) {
-  const res = await fetch(url, {
-    ...options,
-    headers: { Authorization: `Bearer ${state.accessToken}`, ...(options.headers || {}) },
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Drive API ${res.status}: ${body}`);
-  }
-  return res;
-}
-
-async function findOrCreateFolder(name, parentId) {
-  const q = encodeURIComponent(
-    `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`
-  );
-  const res = await driveFetch(`${DRIVE_FILES}?q=${q}&fields=files(id,name)`);
-  const json = await res.json();
-  if (json.files && json.files.length) return json.files[0].id;
-
-  const createRes = await driveFetch(DRIVE_FILES, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, mimeType: "application/vnd.google-apps.folder", parents: [parentId] }),
-  });
-  const created = await createRes.json();
-  return created.id;
-}
-
-async function findOrCreateDataFile() {
-  const q = encodeURIComponent(
-    `name='${CONFIG.DATA_FILE_NAME}' and '${state.folderId}' in parents and trashed=false`
-  );
-  const res = await driveFetch(`${DRIVE_FILES}?q=${q}&fields=files(id,name)`);
-  const json = await res.json();
-  if (json.files && json.files.length) return json.files[0].id;
-
-  const metadata = { name: CONFIG.DATA_FILE_NAME, parents: [state.folderId], mimeType: "application/json" };
-  const form = new FormData();
-  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-  form.append("file", new Blob([JSON.stringify({ pages: [] })], { type: "application/json" }));
-  const createRes = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id`, {
-    method: "POST",
-    body: form,
-  });
-  const created = await createRes.json();
-  return created.id;
-}
-
-async function loadData() {
-  const res = await driveFetch(`${DRIVE_FILES}/${state.dataFileId}?alt=media`);
-  return await res.json();
-}
-
-// ---------------------------------------------------------------
-// SAVE — dispatches to whichever mode is active
-// ---------------------------------------------------------------
-function queueSave() {
-  setDriveStatus("Saving…");
-  clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(saveDataNow, 700);
-}
-
-async function saveDataNow() {
-  try {
-    if (state.authMode === "backend") {
-      await backendFetch("/api/data", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(state.data),
-      });
-    } else {
-      await driveFetch(`${DRIVE_UPLOAD}/${state.dataFileId}?uploadType=media`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(state.data),
-      });
-    }
-    setDriveStatus("Synced ✓");
-  } catch (e) {
-    console.error(e);
-    setDriveStatus("Save failed — retrying…", true);
-    state.saveTimer = setTimeout(saveDataNow, 3000);
-  }
-}
-
-// ---------------------------------------------------------------
-// MEDIA — upload / move / delete / preview, dispatched by mode
-// isUploadedTarget: true = goes to "Uploaded Reels", false = "Pending Reels"
-// ---------------------------------------------------------------
-async function uploadMedia(file, isUploadedTarget) {
-  if (state.authMode === "backend") {
-    const form = new FormData();
-    form.append("file", file);
-    form.append("target", isUploadedTarget ? "uploaded" : "pending");
-    const res = await backendFetch("/api/upload", { method: "POST", body: form });
-    return await res.json();
-  }
-  const folderId = isUploadedTarget ? state.uploadedFolderId : state.pendingFolderId;
-  const metadata = { name: `${Date.now()}_${file.name}`, parents: [folderId] };
-  const form = new FormData();
-  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-  form.append("file", file);
-  const res = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id,mimeType`, {
-    method: "POST",
-    body: form,
-  });
-  return await res.json(); // {id, mimeType}
-}
-
-async function moveFileBetweenFolders(fileId, fromFolderId, toFolderId) {
-  if (!fileId) return;
-  try {
-    await driveFetch(
-      `${DRIVE_FILES}/${fileId}?addParents=${toFolderId}&removeParents=${fromFolderId}&fields=id,parents`,
-      { method: "PATCH" }
-    );
-  } catch (e) {
-    console.error("Could not move file in Drive:", e);
-  }
-}
-
-async function moveIdeaMedia(idea, toUploaded) {
-  if (state.authMode === "backend") {
-    for (const fileId of [idea.thumbFileId, idea.videoFileId]) {
-      if (!fileId) continue;
-      try {
-        await backendFetch("/api/move", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileId, toUploaded }),
-        });
-      } catch (e) { console.error(e); }
-    }
-    return;
-  }
-  const from = toUploaded ? state.pendingFolderId : state.uploadedFolderId;
-  const to = toUploaded ? state.uploadedFolderId : state.pendingFolderId;
-  await Promise.all([
-    moveFileBetweenFolders(idea.thumbFileId, from, to),
-    moveFileBetweenFolders(idea.videoFileId, from, to),
-  ]);
-}
-
-async function deleteFile(fileId) {
-  if (!fileId) return;
-  try {
-    if (state.authMode === "backend") {
-      await backendFetch(`/api/file/${fileId}`, { method: "DELETE" });
-    } else {
-      await driveFetch(`${DRIVE_FILES}/${fileId}`, { method: "DELETE" });
-    }
-  } catch (e) { /* ignore */ }
-}
-
-async function getImageBlobUrl(fileId) {
-  if (state.blobCache.has(fileId)) return state.blobCache.get(fileId);
-  const res = state.authMode === "backend"
-    ? await backendFetch(`/api/file/${fileId}`)
-    : await driveFetch(`${DRIVE_FILES}/${fileId}?alt=media`);
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  state.blobCache.set(fileId, url);
-  return url;
-}
-
-// ---------------------------------------------------------------
-// HELPERS
-// ---------------------------------------------------------------
-function uid() {
-  return (crypto.randomUUID ? crypto.randomUUID() : "id-" + Date.now() + "-" + Math.random().toString(16).slice(2));
-}
-function codePrefix(name) {
-  const letters = name.replace(/[^a-zA-Z]/g, "").toUpperCase();
-  return (letters.slice(0, 2) || "PG");
-}
-function currentPage() {
-  return state.data.pages.find((p) => p.id === state.currentPageId) || null;
-}
-async function showVideoPreview(fileId) {
-  try {
-    const url = await getImageBlobUrl(fileId);
-    document.getElementById("video-modal-player").src = url;
-    document.getElementById("video-modal").hidden = false;
-  } catch (e) {
-    console.error(e);
-    toast("Could not load this video.", "error");
-  }
-}
-
-document.getElementById("video-modal-close").addEventListener("click", () => {
-  const player = document.getElementById("video-modal-player");
-  player.pause();
-  player.src = "";
-  document.getElementById("video-modal").hidden = true;
-});
-
-function toast(msg, type) {
-  const el = document.getElementById("toast");
-  el.textContent = msg;
-  el.className = "toast" + (type ? " " + type : "");
-  el.hidden = false;
-  clearTimeout(el._t);
-  el._t = setTimeout(() => (el.hidden = true), 3200);
-}
-function escapeHtml(s) {
-  return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-// ---------------------------------------------------------------
-// PAGE LIST / SIDEBAR
-// ---------------------------------------------------------------
-document.getElementById("add-page-btn").addEventListener("click", async () => {
-  const name = await showPrompt({ title: "Name this Facebook page", placeholder: "e.g. Crash Craze", confirmLabel: "Add page" });
-  if (!name) return;
-  const page = {
-    id: uid(),
-    name: name.trim(),
-    codePrefix: codePrefix(name.trim()),
-    masterPrompt: "",
-    ideaCounter: 0,
-    ideas: [],
-    customTables: [],
-  };
-  state.data.pages.push(page);
-  state.currentPageId = page.id;
-  queueSave();
-  renderPageList();
-  renderCurrentView();
-});
-
-function renderPageList() {
-  const wrap = document.getElementById("page-list");
-  wrap.innerHTML = "";
-  state.data.pages.forEach((page) => {
-    const div = document.createElement("div");
-    div.className = "page-card" + (page.id === state.currentPageId ? " active" : "");
-    const pending = page.ideas.filter((i) => !i.uploaded).length;
-    div.innerHTML = `
-      <div class="page-avatar">${escapeHtml(page.name.slice(0, 2).toUpperCase())}</div>
-      <div class="page-card-info">
-        <div class="page-card-name">${escapeHtml(page.name)}</div>
-        <div class="page-card-meta">${pending} pending</div>
-      </div>`;
-    div.addEventListener("click", () => {
-      state.currentPageId = page.id;
-      renderPageList();
-      renderCurrentView();
-      document.getElementById("sidebar").classList.remove("open");
-    });
-    wrap.appendChild(div);
-  });
-}
-
-document.getElementById("sidebar-toggle").addEventListener("click", () => {
-  document.getElementById("sidebar").classList.toggle("open");
-});
-
-document.getElementById("rename-page-btn").addEventListener("click", async () => {
-  const page = currentPage();
-  if (!page) return;
-  const name = await showPrompt({ title: "Rename page", defaultValue: page.name, confirmLabel: "Save" });
-  if (!name) return;
-  page.name = name;
-  queueSave();
-  renderPageList();
-  renderCurrentView();
-});
-
-document.getElementById("delete-page-btn").addEventListener("click", async () => {
-  const page = currentPage();
-  if (!page) return;
-  const ok = await showConfirm({
-    title: "Delete this page?",
-    message: `"${page.name}" and all its ideas will be permanently deleted. This can't be undone.`,
-    danger: true,
-  });
-  if (!ok) return;
-  state.data.pages = state.data.pages.filter((p) => p.id !== page.id);
-  state.currentPageId = null;
-  queueSave();
-  renderPageList();
-  renderCurrentView();
-});
-
-// ---------------------------------------------------------------
-// TABS
-// ---------------------------------------------------------------
-document.querySelectorAll(".tab-btn").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    state.currentTab = btn.dataset.tab;
-    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
-    document.querySelectorAll(".tab-panel").forEach((p) => (p.hidden = true));
-    document.getElementById("tab-" + btn.dataset.tab).hidden = false;
-    if (btn.dataset.tab === "uploaded") renderUploadedTable();
-    if (btn.dataset.tab === "tables") renderCustomTables();
-    if (btn.dataset.tab === "automation") renderAutomationTab();
-  });
-});
-
-// ---------------------------------------------------------------
-// MAIN RENDER
-// ---------------------------------------------------------------
-function renderCurrentView() {
-  const page = currentPage();
-  document.getElementById("empty-state").hidden = !!page;
-  document.getElementById("page-view").hidden = !page;
-  if (!page) return;
-
-  document.getElementById("page-title-display").textContent = page.name;
-  document.getElementById("master-prompt-input").value = page.masterPrompt || "";
-  if (!page.customTables) page.customTables = [];
-  renderIdeasTable();
-  renderUploadedTable();
-  renderCustomTables();
-}
-
-function renderIdeasTable() {
-  const page = currentPage();
-  const tbody = document.getElementById("ideas-tbody");
-  tbody.innerHTML = "";
-  const pending = page.ideas.filter((i) => !i.uploaded);
-  document.getElementById("ideas-count").textContent = `${pending.length} idea${pending.length === 1 ? "" : "s"}`;
-  document.getElementById("ideas-empty").hidden = pending.length > 0;
-
-  pending.forEach((idea) => tbody.appendChild(buildIdeaRow(idea, page, false)));
-}
-
-function renderUploadedTable() {
-  const page = currentPage();
-  if (!page) return;
-  const tbody = document.getElementById("uploaded-tbody");
-  tbody.innerHTML = "";
-  const done = page.ideas.filter((i) => i.uploaded);
-  document.getElementById("uploaded-empty").hidden = done.length > 0;
-  done.forEach((idea) => tbody.appendChild(buildIdeaRow(idea, page, true)));
-}
-
-function buildIdeaRow(idea, page, isUploadedView) {
-  const tr = document.createElement("tr");
-  if (idea.uploaded) tr.classList.add("done");
-
-  const thumbCell = idea.thumbFileId
-    ? `<img class="thumb-thumbnail" data-thumb-id="${idea.thumbFileId}" alt="thumbnail">`
-    : `<div class="thumb-placeholder"></div>`;
-
-  const videoCell = idea.videoFileId
-    ? `<button type="button" class="video-link video-preview-btn" data-video-id="${idea.videoFileId}">▶ Preview</button>`
-    : `<span class="video-none">—</span>`;
-
-  tr.innerHTML = `
-    <td><span class="idea-code">${page.codePrefix}-${String(idea.code).padStart(3, "0")}</span></td>
-    <td class="idea-title">${escapeHtml(idea.title)}</td>
-    <td class="idea-desc" title="${escapeHtml(idea.description)}">${escapeHtml(idea.description) || "—"}</td>
-    <td class="idea-tags">${escapeHtml(idea.hashtags) || "—"}</td>
-    <td class="idea-date">${idea.date || "—"}</td>
-    <td class="idea-date">${idea.time || "—"}</td>
-    <td>${thumbCell}</td>
-    <td>${videoCell}</td>
-    ${isUploadedView ? "" : `<td class="col-done"><input type="checkbox" class="check-toggle" ${idea.uploaded ? "checked" : ""}></td>`}
-    <td class="row-actions">
-      ${!isUploadedView && state.authMode === "backend" ? `<button class="icon-btn publish-btn" title="Publish to Facebook now">📤</button>` : ""}
-      <button class="icon-btn edit-btn" title="Edit">✎</button>
-      <button class="icon-btn danger del-btn" title="Delete">🗑</button>
-    </td>`;
-
-  const img = tr.querySelector("[data-thumb-id]");
-  if (img) {
-    getImageBlobUrl(idea.thumbFileId).then((url) => (img.src = url)).catch(() => {});
-  }
-
-  const videoBtn = tr.querySelector("[data-video-id]");
-  if (videoBtn) {
-    videoBtn.addEventListener("click", () => showVideoPreview(idea.videoFileId));
-  }
-
-  const checkbox = tr.querySelector(".check-toggle");
-  if (checkbox) {
-    checkbox.addEventListener("change", async () => {
-      const newVal = checkbox.checked;
-      idea.uploaded = newVal;
-      idea.uploadedAt = newVal ? new Date().toISOString().slice(0, 10) : null;
-      queueSave();
-      renderIdeasTable();
-      renderUploadedTable();
-      renderPageList();
-      if (idea.thumbFileId || idea.videoFileId) {
-        setDriveStatus("Moving files in Drive…");
-        await moveIdeaMedia(idea, newVal);
-        setDriveStatus("Synced ✓");
-      }
-    });
-  }
-
-  tr.querySelector(".edit-btn").addEventListener("click", () => openIdeaModal(idea));
-
-  const publishBtn = tr.querySelector(".publish-btn");
-  if (publishBtn) {
-    publishBtn.addEventListener("click", async () => {
-      const ok = await showConfirm({ title: "Publish now?", message: `"${idea.title}" will be posted to your linked Facebook Page immediately.` });
-      if (!ok) return;
-      publishBtn.disabled = true;
-      try {
-        await backendFetch("/api/facebook/publish-now", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pageId: page.id, ideaId: idea.id }),
-        });
-        toast("Published to Facebook.", "success");
-        await bootstrapDrive();
-      } catch (e) {
-        console.error(e);
-        toast("Could not publish. Check the Automation tab is connected.", "error");
-      } finally {
-        publishBtn.disabled = false;
-      }
-    });
-  }
-  tr.querySelector(".del-btn").addEventListener("click", async () => {
-    const ok = await showConfirm({ title: "Delete this idea?", message: `"${idea.title}" will be permanently removed, along with its thumbnail and video.`, danger: true });
-    if (!ok) return;
-    await deleteFile(idea.thumbFileId);
-    await deleteFile(idea.videoFileId);
-    page.ideas = page.ideas.filter((i) => i.id !== idea.id);
-    queueSave();
-    renderIdeasTable();
-    renderUploadedTable();
-    renderPageList();
-  });
-
-  return tr;
-}
-
-// ---------------------------------------------------------------
-// MASTER PROMPT
-// ---------------------------------------------------------------
-document.getElementById("save-master-btn").addEventListener("click", () => {
-  const page = currentPage();
-  if (!page) return;
-  page.masterPrompt = document.getElementById("master-prompt-input").value;
-  queueSave();
-  const tag = document.getElementById("master-saved-tag");
-  tag.hidden = false;
-  setTimeout(() => (tag.hidden = true), 2000);
-});
-
-// ---------------------------------------------------------------
-// IDEA MODAL (add / edit)
-// ---------------------------------------------------------------
-let editingIdeaId = null;
-let pendingThumbFile = null;
-let pendingVideoFile = null;
-
-document.getElementById("add-idea-btn").addEventListener("click", () => openIdeaModal(null));
-document.getElementById("modal-cancel").addEventListener("click", closeIdeaModal);
-
-function openIdeaModal(idea) {
-  editingIdeaId = idea ? idea.id : null;
-  pendingThumbFile = null;
-  pendingVideoFile = null;
-  document.getElementById("modal-title").textContent = idea ? "Edit idea" : "New idea";
-  document.getElementById("f-title").value = idea ? idea.title : "";
-  document.getElementById("f-desc").value = idea ? idea.description : "";
-  document.getElementById("f-hashtags").value = idea ? idea.hashtags : "";
-  document.getElementById("f-date").value = idea ? idea.date || "" : "";
-  document.getElementById("f-time").value = idea ? idea.time || "" : "";
-  document.getElementById("f-thumb").value = "";
-  document.getElementById("f-video").value = "";
-  document.getElementById("upload-progress").hidden = true;
-
-  const thumbPrev = document.getElementById("thumb-preview");
-  const videoPrev = document.getElementById("video-preview");
-  thumbPrev.hidden = true;
-  videoPrev.hidden = true;
-  if (idea && idea.thumbFileId) {
-    getImageBlobUrl(idea.thumbFileId).then((url) => {
-      thumbPrev.innerHTML = `<img src="${url}"><div class="file-name">Current thumbnail (choose a file to replace)</div>`;
-      thumbPrev.hidden = false;
-    });
-  }
-  if (idea && idea.videoFileId) {
-    videoPrev.innerHTML = `<div class="file-name">Current video is saved (choose a file to replace)</div>`;
-    videoPrev.hidden = false;
-  }
-
-  document.getElementById("idea-modal").hidden = false;
-}
-
-function closeIdeaModal() {
-  document.getElementById("idea-modal").hidden = true;
-  editingIdeaId = null;
-}
-
-document.getElementById("f-thumb").addEventListener("change", (e) => {
-  pendingThumbFile = e.target.files[0] || null;
-  const prev = document.getElementById("thumb-preview");
-  if (!pendingThumbFile) { prev.hidden = true; return; }
-  const reader = new FileReader();
-  reader.onload = () => {
-    prev.innerHTML = `<img src="${reader.result}"><div class="file-name">${escapeHtml(pendingThumbFile.name)}</div>`;
-    prev.hidden = false;
-  };
-  reader.readAsDataURL(pendingThumbFile);
-});
-
-document.getElementById("f-video").addEventListener("change", (e) => {
-  pendingVideoFile = e.target.files[0] || null;
-  const prev = document.getElementById("video-preview");
-  if (!pendingVideoFile) { prev.hidden = true; return; }
-  const sizeMb = (pendingVideoFile.size / (1024 * 1024)).toFixed(1);
-  prev.innerHTML = `<div class="file-name">${escapeHtml(pendingVideoFile.name)} (${sizeMb} MB)</div>`;
-  prev.hidden = false;
-});
-
-document.getElementById("modal-save").addEventListener("click", async () => {
-  const page = currentPage();
-  if (!page) return;
-  const title = document.getElementById("f-title").value.trim();
-  if (!title) { toast("Give the idea a title first.", "error"); return; }
-
-  const progress = document.getElementById("upload-progress");
-  const saveBtn = document.getElementById("modal-save");
-  saveBtn.disabled = true;
-
-  try {
-    let idea = editingIdeaId ? page.ideas.find((i) => i.id === editingIdeaId) : null;
-    const isNew = !idea;
-    if (isNew) {
-      page.ideaCounter += 1;
-      idea = { id: uid(), code: page.ideaCounter, uploaded: false, thumbFileId: null, videoFileId: null, videoLink: null };
-      page.ideas.push(idea);
-    }
-
-    idea.title = title;
-    idea.description = document.getElementById("f-desc").value.trim();
-    idea.hashtags = document.getElementById("f-hashtags").value.trim();
-    idea.date = document.getElementById("f-date").value;
-    idea.time = document.getElementById("f-time").value;
-
-    if (pendingThumbFile) {
-      progress.hidden = false;
-      progress.textContent = "Uploading thumbnail…";
-      if (idea.thumbFileId) await deleteFile(idea.thumbFileId);
-      const uploaded = await uploadMedia(pendingThumbFile, idea.uploaded);
-      idea.thumbFileId = uploaded.id;
-      state.blobCache.delete(uploaded.id);
-    }
-    if (pendingVideoFile) {
-      progress.hidden = false;
-      progress.textContent = "Uploading video…";
-      if (idea.videoFileId) await deleteFile(idea.videoFileId);
-      const uploaded = await uploadMedia(pendingVideoFile, idea.uploaded);
-      idea.videoFileId = uploaded.id;
-      state.blobCache.delete(uploaded.id);
-    }
-
-    queueSave();
-    closeIdeaModal();
-    renderIdeasTable();
-    renderUploadedTable();
-    renderPageList();
-    toast("Idea saved.", "success");
-  } catch (e) {
-    console.error(e);
-    toast("Something went wrong saving this idea.", "error");
-  } finally {
-    saveBtn.disabled = false;
-    progress.hidden = true;
-  }
-});
-
-// ---------------------------------------------------------------
-// CUSTOM TABLES — fully user-defined headings & content
-// Each row has a "Used" checkbox — ticking it draws a strikethrough
-// through that row's content (mirrors the Ideas -> Uploaded pattern).
-// ---------------------------------------------------------------
-document.getElementById("add-table-btn").addEventListener("click", async () => {
-  const page = currentPage();
-  if (!page) return;
-  const name = await showPrompt({ title: "Name this table", defaultValue: "Untitled Table", confirmLabel: "Create table" });
-  if (!name) return;
-  if (!page.customTables) page.customTables = [];
-  const table = {
-    id: uid(),
-    name,
-    columns: [
-      { id: uid(), label: "Column 1" },
-      { id: uid(), label: "Column 2" },
-    ],
-    rows: [],
-  };
-  page.customTables.push(table);
-  queueSave();
-  renderCustomTables();
-});
-
-function renderCustomTables() {
-  const page = currentPage();
-  const wrap = document.getElementById("custom-tables-list");
-  if (!wrap) return;
-  wrap.innerHTML = "";
-  if (!page) return;
-  if (!page.customTables) page.customTables = [];
-  if (!page.customTables.length) {
-    wrap.innerHTML = `<div class="table-empty">No custom tables yet — click "+ New table" above to build one.</div>`;
-    return;
-  }
-  page.customTables.forEach((table) => wrap.appendChild(buildCustomTableCard(table, page)));
-}
-
-function buildCustomTableCard(table, page) {
-  const card = document.createElement("div");
-  card.className = "custom-table-card";
-
-  const header = document.createElement("div");
-  header.className = "custom-table-header";
-  header.innerHTML = `
-    <input class="custom-table-name" value="${escapeHtml(table.name)}" title="Table name">
-    <div class="custom-table-actions">
-      <button class="btn-ghost add-col-btn">+ Column</button>
-      <button class="btn-ghost add-row-btn">+ Row</button>
-      <button class="icon-btn danger del-table-btn" title="Delete this table">🗑</button>
-    </div>`;
-  card.appendChild(header);
-
-  header.querySelector(".custom-table-name").addEventListener("change", (e) => {
-    table.name = e.target.value.trim() || "Untitled Table";
-    queueSave();
-  });
-  header.querySelector(".add-col-btn").addEventListener("click", async () => {
-    const label = await showPrompt({ title: "New column heading", defaultValue: "New Column", confirmLabel: "Add column" });
-    if (!label) return;
-    const col = { id: uid(), label };
-    table.columns.push(col);
-    table.rows.forEach((r) => (r.cells[col.id] = ""));
-    queueSave();
-    renderCustomTables();
-  });
-  header.querySelector(".add-row-btn").addEventListener("click", () => {
-    const cells = {};
-    table.columns.forEach((c) => (cells[c.id] = ""));
-    table.rows.push({ id: uid(), cells, done: false });
-    queueSave();
-    renderCustomTables();
-  });
-  header.querySelector(".del-table-btn").addEventListener("click", async () => {
-    const ok = await showConfirm({ title: "Delete this table?", message: `"${table.name}" and everything in it will be permanently deleted.`, danger: true });
-    if (!ok) return;
-    page.customTables = page.customTables.filter((t) => t.id !== table.id);
-    queueSave();
-    renderCustomTables();
-  });
-
-  const tableWrap = document.createElement("div");
-  tableWrap.className = "table-wrap";
-  const tableEl = document.createElement("table");
-  tableEl.className = "reel-table custom-table";
-
-  const thead = document.createElement("thead");
-  const headRow = document.createElement("tr");
-  table.columns.forEach((col) => {
-    const th = document.createElement("th");
-    th.innerHTML = `<div class="col-head">
-        <input class="col-label-input" value="${escapeHtml(col.label)}">
-        <button class="col-del-btn" title="Remove this column">×</button>
-      </div>`;
-    th.querySelector(".col-label-input").addEventListener("change", (e) => {
-      col.label = e.target.value.trim() || "Column";
-      queueSave();
-    });
-    th.querySelector(".col-del-btn").addEventListener("click", async () => {
-      if (table.columns.length <= 1) { toast("A table needs at least one column.", "error"); return; }
-      const ok = await showConfirm({ title: "Remove this column?", message: `"${col.label}" will be removed from every row.`, danger: true });
-      if (!ok) return;
-      table.columns = table.columns.filter((c) => c.id !== col.id);
-      table.rows.forEach((r) => delete r.cells[col.id]);
-      queueSave();
-      renderCustomTables();
-    });
-    headRow.appendChild(th);
-  });
-  const usedTh = document.createElement("th");
-  usedTh.className = "col-done";
-  usedTh.textContent = "Used";
-  headRow.appendChild(usedTh);
-  headRow.appendChild(document.createElement("th")).className = "col-actions";
-  thead.appendChild(headRow);
-  tableEl.appendChild(thead);
-
-  const tbody = document.createElement("tbody");
-  if (!table.rows.length) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = table.columns.length + 2;
-    td.className = "table-empty";
-    td.textContent = 'No rows yet — click "+ Row" above to add one.';
-    tr.appendChild(td);
-    tbody.appendChild(tr);
-  } else {
-    table.rows.forEach((row) => {
-      const tr = document.createElement("tr");
-      if (row.done) tr.classList.add("done");
-
-      table.columns.forEach((col) => {
-        const td = document.createElement("td");
-        const cellInput = document.createElement("textarea");
-        cellInput.className = "cell-input";
-        cellInput.rows = 1;
-        cellInput.value = row.cells[col.id] || "";
-        cellInput.addEventListener("input", () => {
-          cellInput.style.height = "auto";
-          cellInput.style.height = cellInput.scrollHeight + "px";
-        });
-        cellInput.addEventListener("change", (e) => {
-          row.cells[col.id] = e.target.value;
-          queueSave();
-        });
-        td.appendChild(cellInput);
-        tr.appendChild(td);
-      });
-
-      const usedTd = document.createElement("td");
-      usedTd.className = "col-done";
-      const usedCheckbox = document.createElement("input");
-      usedCheckbox.type = "checkbox";
-      usedCheckbox.className = "check-toggle";
-      usedCheckbox.checked = !!row.done;
-      usedCheckbox.addEventListener("change", () => {
-        row.done = usedCheckbox.checked;
-        queueSave();
-        tr.classList.toggle("done", row.done);
-      });
-      usedTd.appendChild(usedCheckbox);
-      tr.appendChild(usedTd);
-
-      const tdActions = document.createElement("td");
-      tdActions.className = "row-actions";
-      tdActions.innerHTML = `<button class="icon-btn danger del-row-btn" title="Delete row">🗑</button>`;
-      tdActions.querySelector(".del-row-btn").addEventListener("click", async () => {
-        const ok = await showConfirm({ title: "Delete this row?", message: "This row will be permanently removed.", danger: true });
-        if (!ok) return;
-        table.rows = table.rows.filter((r) => r.id !== row.id);
-        queueSave();
-        renderCustomTables();
-      });
-      tr.appendChild(tdActions);
-      tbody.appendChild(tr);
-    });
-  }
-  tableEl.appendChild(tbody);
-  tableWrap.appendChild(tableEl);
-  card.appendChild(tableWrap);
-  return card;
-}
-
-// ---------------------------------------------------------------
-// AUTOMATION TAB — link a Facebook Page, show status, connect/disconnect
-// ---------------------------------------------------------------
-async function renderAutomationTab() {
-  const page = currentPage();
-  if (!page) return;
-
-  const locked = document.getElementById("automation-locked");
-  const panel = document.getElementById("automation-panel");
-
-  if (state.authMode !== "backend") {
-    locked.hidden = false;
-    panel.hidden = true;
-    return;
-  }
-  locked.hidden = true;
-  panel.hidden = false;
-
-  const statusEl = document.getElementById("automation-status");
-  const connectBtn = document.getElementById("fb-connect-btn");
-  const unlinkBtn = document.getElementById("fb-unlink-btn");
-  statusEl.textContent = "Checking…";
-  unlinkBtn.hidden = true;
-
-  try {
-    const res = await backendFetch("/api/facebook/status");
-    const links = await res.json();
-    const link = links[page.id];
-    if (link) {
-      statusEl.textContent = `Connected to Facebook Page: "${link.fb_page_name}"`;
-      connectBtn.textContent = "Reconnect / change Page";
-      unlinkBtn.hidden = false;
-    } else {
-      statusEl.textContent = "Not connected yet.";
-      connectBtn.textContent = "Connect Facebook Page";
-    }
-  } catch (e) {
-    console.error(e);
-    statusEl.textContent = "Could not check connection status.";
-  }
-}
-
-document.getElementById("fb-connect-btn").addEventListener("click", async () => {
-  const page = currentPage();
-  if (!page) return;
-  try {
-    const res = await backendFetch(`/api/facebook/connect-url?pageId=${encodeURIComponent(page.id)}`);
-    const body = await res.json();
-    window.open(body.url, "_blank");
-    toast("Finish connecting in the new tab, then come back and refresh this tab.");
-  } catch (e) {
-    console.error(e);
-    toast("Could not start Facebook connection.", "error");
-  }
-});
-
-document.getElementById("fb-unlink-btn").addEventListener("click", async () => {
-  const page = currentPage();
-  if (!page) return;
-  const ok = await showConfirm({ title: "Disconnect this Facebook Page?", message: "Automatic publishing for this page will stop until you reconnect." });
-  if (!ok) return;
-  try {
-    await backendFetch("/api/facebook/unlink", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pageId: page.id }),
-    });
-    toast("Disconnected.", "success");
-    renderAutomationTab();
-  } catch (e) {
-    console.error(e);
-    toast("Could not disconnect.", "error");
-  }
-});
+<!doctype html>
+<html lang="en">
+<head>
+<script>
+  (function(){
+    try {
+      var t = localStorage.getItem('rr_theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', t);
+    } catch(e){}
+  })();
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reel Room — Content Pipeline</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<button id="theme-toggle-btn" class="theme-toggle-fab" title="Toggle light / dark mode">🌙</button>
+
+<!-- ===== LOGIN SCREEN ===== -->
+<div id="login-screen" class="login-screen">
+  <div class="login-card">
+    <div class="login-mark">RR</div>
+    <h1>Reel Room</h1>
+    <p class="login-sub">A shot list for every page you run.</p>
+    <button id="google-signin-btn" class="btn-google">
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.57 2.7-3.88 2.7-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.98v2.33A9 9 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.95 10.7A5.4 5.4 0 0 1 3.67 9c0-.59.1-1.17.28-1.7V4.97H.98A9 9 0 0 0 0 9c0 1.45.35 2.83.98 4.03l2.97-2.33z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .98 4.97l2.97 2.33C4.66 5.17 6.65 3.58 9 3.58z"/></svg>
+      Continue with Google
+    </button>
+
+    <button id="show-id-login-btn" class="link-btn">Login with ID &amp; Password instead →</button>
+
+    <div id="id-login-form" class="id-login-form" hidden>
+      <label for="id-username">Username</label>
+      <input id="id-username" type="text" autocomplete="username">
+      <label for="id-password">Password</label>
+      <input id="id-password" type="password" autocomplete="current-password">
+      <button id="id-login-btn" class="btn-primary" style="width:100%; margin-top:14px;">Log in</button>
+      <button id="back-to-google-btn" class="link-btn">← Back</button>
+    </div>
+
+    <p class="login-hint">Your ideas, prompts and reels are saved straight to your own Google Drive — nothing touches a third-party server.</p>
+  </div>
+</div>
+
+<!-- ===== APP SHELL ===== -->
+<div id="app" class="app" hidden>
+
+  <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Toggle menu">☰</button>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span class="brand">Reel Room</span>
+      <button id="add-page-btn" class="btn-icon" title="Add a page">+</button>
+    </div>
+
+    <div id="page-list" class="page-list"></div>
+
+    <div class="sidebar-footer">
+      <button id="theme-toggle-btn" class="theme-toggle" title="Switch theme">
+        <span class="theme-icon-dark">🌙</span>
+        <span class="theme-icon-light">☀️</span>
+        <span id="theme-toggle-label">Dark mode</span>
+      </button>
+      <div id="drive-status" class="drive-status">Syncing to Drive…</div>
+      <div class="account-row">
+        <img id="account-avatar" class="account-avatar" alt="">
+        <span id="account-name" class="account-name"></span>
+      </div>
+      <button id="signout-btn" class="signout-btn">Sign out</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div id="empty-state" class="empty-state">
+      <div class="empty-mark">＋</div>
+      <h2>No page open yet</h2>
+      <p>Add a Facebook page on the left to start stacking ideas for it.</p>
+    </div>
+
+    <div id="page-view" class="page-view" hidden>
+      <header class="page-header">
+        <div>
+          <h2 id="page-title-display"></h2>
+          <span class="page-sub">Content workspace</span>
+        </div>
+        <div class="header-actions">
+          <button id="rename-page-btn" class="btn-ghost">Rename</button>
+          <button id="delete-page-btn" class="btn-ghost btn-danger">Delete page</button>
+        </div>
+      </header>
+
+      <nav class="tabs" role="tablist">
+        <button class="tab-btn active" data-tab="ideas">Ideas</button>
+        <button class="tab-btn" data-tab="master">Master Prompt</button>
+        <button class="tab-btn" data-tab="uploaded">Uploaded Reels</button>
+        <button class="tab-btn" data-tab="tables">Custom Tables</button>
+        <button class="tab-btn" data-tab="automation">Automation</button>
+      </nav>
+
+      <!-- IDEAS TAB -->
+      <section id="tab-ideas" class="tab-panel">
+        <div class="panel-toolbar">
+          <span id="ideas-count" class="panel-count"></span>
+          <button id="add-idea-btn" class="btn-primary">+ New idea</button>
+        </div>
+        <div class="table-wrap">
+          <table class="reel-table">
+            <thead>
+              <tr>
+                <th class="col-code">Code</th>
+                <th>Title</th>
+                <th class="col-desc">Description</th>
+                <th>Tags</th>
+                <th>Date</th>
+                <th>Time</th>
+                <th>Thumb</th>
+                <th>Video</th>
+                <th class="col-done">Uploaded</th>
+                <th class="col-actions"></th>
+              </tr>
+            </thead>
+            <tbody id="ideas-tbody"></tbody>
+          </table>
+          <div id="ideas-empty" class="table-empty" hidden>No ideas yet. Add your first one above.</div>
+        </div>
+      </section>
+
+      <!-- MASTER PROMPT TAB -->
+      <section id="tab-master" class="tab-panel" hidden>
+        <div class="master-panel">
+          <label for="master-prompt-input">Master / sticky prompt for this page</label>
+          <p class="field-hint">Kept separate from individual ideas — reuse it as your base style, tone or system prompt.</p>
+          <textarea id="master-prompt-input" rows="12" placeholder="e.g. Write hooks in Roman Urdu, punchy first line, CTA to follow the page…"></textarea>
+          <button id="save-master-btn" class="btn-primary">Save prompt</button>
+          <span id="master-saved-tag" class="saved-tag" hidden>Saved ✓</span>
+        </div>
+      </section>
+
+      <!-- UPLOADED REELS TAB -->
+      <section id="tab-uploaded" class="tab-panel" hidden>
+        <div class="table-wrap">
+          <table class="reel-table">
+            <thead>
+              <tr>
+                <th class="col-code">Code</th>
+                <th>Title</th>
+                <th class="col-desc">Description</th>
+                <th>Tags</th>
+                <th>Date</th>
+                <th>Time</th>
+                <th>Thumb</th>
+                <th>Video</th>
+                <th class="col-actions"></th>
+              </tr>
+            </thead>
+            <tbody id="uploaded-tbody"></tbody>
+          </table>
+          <div id="uploaded-empty" class="table-empty" hidden>Nothing uploaded yet — tick "Uploaded" on an idea to move it here.</div>
+        </div>
+      </section>
+
+      <!-- CUSTOM TABLES TAB (fully user-defined headings & content) -->
+      <section id="tab-tables" class="tab-panel" hidden>
+        <div class="panel-toolbar">
+          <span class="panel-count">Build your own table — any headings, any content</span>
+          <button id="add-table-btn" class="btn-primary">+ New table</button>
+        </div>
+        <div id="custom-tables-list" class="custom-tables-list"></div>
+      </section>
+
+      <!-- AUTOMATION TAB — link a real Facebook Page, auto-publish on schedule -->
+      <section id="tab-automation" class="tab-panel" hidden>
+        <div id="automation-locked" class="master-panel" hidden>
+          <label>Automation needs backend login</label>
+          <p class="field-hint">
+            Auto-publishing runs on a schedule, in the background — that only works through
+            the ID &amp; Password login mode. Sign out and log back in with
+            "Login with ID &amp; Password instead" to set this up.
+          </p>
+        </div>
+        <div id="automation-panel" class="master-panel" hidden>
+          <label>Facebook Page connection</label>
+          <p id="automation-status" class="field-hint">Checking…</p>
+          <button id="fb-connect-btn" class="btn-primary">Connect Facebook Page</button>
+          <button id="fb-unlink-btn" class="btn-ghost btn-danger" hidden>Disconnect</button>
+          <p class="field-hint" style="margin-top:18px;">
+            Once connected, any idea whose <strong>Scheduled date</strong> is today will be
+            posted automatically as a Reel (if it has a video) or a photo post (if it only
+            has a thumbnail) — once a day, no manual work needed.
+          </p>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<!-- ===== ADD/EDIT IDEA MODAL ===== -->
+<div id="idea-modal" class="modal" hidden>
+  <div class="modal-card">
+    <h3 id="modal-title">New idea</h3>
+
+    <label for="f-title">Title</label>
+    <input id="f-title" type="text" placeholder="e.g. Behind the scenes reel">
+
+    <label for="f-desc">Description</label>
+    <textarea id="f-desc" rows="3" placeholder="What happens in this reel…"></textarea>
+
+    <label for="f-hashtags">Hashtags</label>
+    <input id="f-hashtags" type="text" placeholder="#reels #fbpage #trending">
+
+    <label for="f-date">Scheduled date</label>
+    <input id="f-date" type="date">
+
+    <label for="f-time">Scheduled time</label>
+    <input id="f-time" type="time">
+    <p class="field-hint" style="margin-top:4px;">Used by auto-publish — posts within ~30 minutes of this time.</p>
+
+    <div class="field-row">
+      <div class="field-col">
+        <label for="f-thumb">Thumbnail</label>
+        <input id="f-thumb" type="file" accept="image/*">
+        <div id="thumb-preview" class="file-preview" hidden></div>
+      </div>
+      <div class="field-col">
+        <label for="f-video">Video</label>
+        <input id="f-video" type="file" accept="video/*">
+        <div id="video-preview" class="file-preview" hidden></div>
+      </div>
+    </div>
+
+    <div id="upload-progress" class="upload-progress" hidden>Uploading to Drive…</div>
+
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn-ghost">Cancel</button>
+      <button id="modal-save" class="btn-primary">Save idea</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== GENERIC PROMPT/CONFIRM MODAL (replaces native browser popups) ===== -->
+<div id="generic-modal" class="modal" hidden>
+  <div class="modal-card small">
+    <h3 id="generic-modal-title">Title</h3>
+    <p id="generic-modal-message" class="generic-modal-message" hidden></p>
+    <input id="generic-modal-input" type="text" hidden>
+    <div class="modal-actions">
+      <button id="generic-modal-cancel" class="btn-ghost">Cancel</button>
+      <button id="generic-modal-confirm" class="btn-primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== VIDEO PREVIEW MODAL ===== -->
+<div id="video-modal" class="modal" hidden>
+  <div class="modal-card video-modal-card">
+    <div class="video-modal-header">
+      <h3>Video preview</h3>
+      <button id="video-modal-close" class="icon-btn" title="Close">✕</button>
+    </div>
+    <video id="video-modal-player" controls autoplay></video>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
