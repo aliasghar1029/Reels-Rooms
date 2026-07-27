@@ -1,21 +1,21 @@
-# =====================================================================
-# Reel Room — Backend Proxy
-#
-# Two jobs:
-#  1) Let a restricted PC use the site via username+password instead of
-#     Google sign-in (proxies all Drive calls — unchanged from before).
-#  2) Let each internal "page" be linked to a real Facebook Page, so the
-#     daily_publish.py script can auto-post Reels/photos on their
-#     scheduled date. See FACEBOOK_SETUP_GUIDE.md.
-#
-# Environment variables (set on PythonAnywhere / Render dashboard):
-#   APP_USERS_JSON        {"username": {"password_hash": "...", "refresh_token": "..."}}
-#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   same OAuth client as the site
-#   JWT_SECRET             any long random string
-#   ALLOWED_ORIGIN          your GitHub Pages origin
-#   FACEBOOK_APP_ID / FACEBOOK_APP_SECRET     from developers.facebook.com
-#   FACEBOOK_REDIRECT_URI    e.g. https://yourname.pythonanywhere.com/api/facebook/callback
-# =====================================================================
+// # =====================================================================
+// # Reel Room — Backend Proxy
+// #
+// # Two jobs:
+// #  1) Let a restricted PC use the site via username+password instead of
+// #     Google sign-in (proxies all Drive calls — unchanged from before).
+// #  2) Let each internal "page" be linked to a real Facebook Page, so the
+// #     daily_publish.py script can auto-post Reels/photos on their
+// #     scheduled date. See FACEBOOK_SETUP_GUIDE.md.
+// #
+// # Environment variables (set on PythonAnywhere / Render dashboard):
+// #   APP_USERS_JSON        {"username": {"password_hash": "...", "refresh_token": "..."}}
+// #   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   same OAuth client as the site
+// #   JWT_SECRET             any long random string
+// #   ALLOWED_ORIGIN          your GitHub Pages origin
+// #   FACEBOOK_APP_ID / FACEBOOK_APP_SECRET     from developers.facebook.com
+// #   FACEBOOK_REDIRECT_URI    e.g. https://yourname.pythonanywhere.com/api/facebook/callback
+// # =====================================================================
 
 import os
 import time
@@ -49,14 +49,14 @@ FACEBOOK_APP_SECRET = os.environ.get("FACEBOOK_APP_SECRET", "")
 FACEBOOK_REDIRECT_URI = os.environ.get("FACEBOOK_REDIRECT_URI", "")
 SCHEDULER_SECRET = os.environ.get("SCHEDULER_SECRET", "")
 
-# Short-lived cache: state token -> list of pages the user just granted
-# access to, while they pick which one to link (a few minutes is plenty).
+// # Short-lived cache: state token -> list of pages the user just granted
+// # access to, while they pick which one to link (a few minutes is plenty).
 _pending_fb_pages = {}
 
 
-# ---------------------------------------------------------------
-# AUTH HELPERS
-# ---------------------------------------------------------------
+// # ---------------------------------------------------------------
+// # AUTH HELPERS
+// # ---------------------------------------------------------------
 def make_jwt(username):
     payload = {"u": username, "exp": datetime.datetime.utcnow() + datetime.timedelta(days=14)}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -83,9 +83,9 @@ def drive_headers(username):
     return {"Authorization": f"Bearer {dh.get_access_token(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)}"}
 
 
-# ---------------------------------------------------------------
-# EXISTING ROUTES — Drive proxy (unchanged behavior)
-# ---------------------------------------------------------------
+// # ---------------------------------------------------------------
+// # EXISTING ROUTES — Drive proxy (unchanged behavior)
+// # ---------------------------------------------------------------
 @app.route("/api/login", methods=["POST"])
 def login():
     body = request.get_json(force=True, silent=True) or {}
@@ -202,9 +202,9 @@ def health():
     return jsonify({"ok": True})
 
 
-# ---------------------------------------------------------------
-# NEW ROUTES — Facebook Page connection
-# ---------------------------------------------------------------
+// # ---------------------------------------------------------------
+// # NEW ROUTES — Facebook Page connection
+// # ---------------------------------------------------------------
 @app.route("/api/facebook/connect-url", methods=["GET"])
 def facebook_connect_url():
     """Frontend opens this in a new tab. state = '<username>:<internalPageId>'."""
