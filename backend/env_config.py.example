@@ -11,3 +11,4 @@ os.environ['FACEBOOK_APP_SECRET'] = 'your-facebook-app-secret'
 os.environ['FACEBOOK_REDIRECT_URI'] = 'https://yourusername.pythonanywhere.com/api/facebook/callback'
 
 os.environ['SCHEDULER_SECRET'] = 'another-long-random-string'
+os.environ['BACKEND_PUBLIC_URL'] = 'https://yourusername.pythonanywhere.com'
