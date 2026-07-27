@@ -31,6 +31,7 @@ import drive_helpers as dh
 import facebook as fb
 import store
 import scheduler_core
+import media_token
 
 app = Flask(__name__)
 
@@ -177,6 +178,25 @@ def get_file(file_id):
     )
 
 
+@app.route("/api/public/media/<file_id>", methods=["GET"])
+def public_media(file_id):
+    """Facebook's servers fetch the actual video/photo bytes from here.
+    Protected by a signed, short-lived token (not a login) — Facebook
+    can't send an Authorization header, so this can't require a JWT."""
+    result = media_token.verify_media_token(request.args.get("token", ""), expected_file_id=file_id)
+    if not result:
+        return jsonify({"error": "Invalid or expired link"}), 403
+    username, _ = result
+    upstream = requests.get(
+        f"{dh.DRIVE_FILES}/{file_id}", headers=drive_headers(username),
+        params={"alt": "media"}, stream=True,
+    )
+    return Response(
+        stream_with_context(upstream.iter_content(chunk_size=65536)),
+        content_type=upstream.headers.get("Content-Type", "application/octet-stream"),
+    )
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
@@ -301,11 +321,16 @@ def facebook_publish_now():
 
 @app.route("/api/scheduler/run", methods=["GET", "POST"])
 def scheduler_run():
-    """Pinged every 15-30 min by a free external service (cron-job.org).
-    Protected by a shared secret so nobody else can trigger it."""
+    """Pinged by free external cron services (cron-job.org). Protected by
+    a shared secret so nobody else can trigger it.
+    - Default (no mode param): time-precise check, runs every 15-30 min.
+    - ?mode=safety: end-of-day catch-all, ignores each idea's time field.
+      Run this one once a day, late at night, as a second cron-job.org job
+      (replaces PythonAnywhere's Scheduled Tasks, which are no longer free)."""
     if not SCHEDULER_SECRET or request.args.get("secret") != SCHEDULER_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
-    log = scheduler_core.run_check(force_all=False)
+    force_all = request.args.get("mode") == "safety"
+    log = scheduler_core.run_check(force_all=force_all)
     return jsonify({"ok": True, "log": log})
 
 
