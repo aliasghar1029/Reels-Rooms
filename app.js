@@ -1,338 +1,1125 @@
-// # =====================================================================
-// # Reel Room — Backend Proxy
-// #
-// # Two jobs:
-// #  1) Let a restricted PC use the site via username+password instead of
-// #     Google sign-in (proxies all Drive calls — unchanged from before).
-// #  2) Let each internal "page" be linked to a real Facebook Page, so the
-// #     daily_publish.py script can auto-post Reels/photos on their
-// #     scheduled date. See FACEBOOK_SETUP_GUIDE.md.
-// #
-// # Environment variables (set on PythonAnywhere / Render dashboard):
-// #   APP_USERS_JSON        {"username": {"password_hash": "...", "refresh_token": "..."}}
-// #   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   same OAuth client as the site
-// #   JWT_SECRET             any long random string
-// #   ALLOWED_ORIGIN          your GitHub Pages origin
-// #   FACEBOOK_APP_ID / FACEBOOK_APP_SECRET     from developers.facebook.com
-// #   FACEBOOK_REDIRECT_URI    e.g. https://yourname.pythonanywhere.com/api/facebook/callback
-// # =====================================================================
+// =====================================================================
+// Reel Room — app.js
+// All data lives in the signed-in user's own Google Drive:
+//   /Reel Room Data/reel-room-data.json   (pages, ideas, prompts)
+//   /Reel Room Data/media/<file>          (thumbnails & videos)
+// The app only ever touches files it created (drive.file scope).
+// =====================================================================
 
-import os
-import time
-import datetime
+// ---------------------------------------------------------------
+// THEME (light / dark) — persisted, both premium
+// ---------------------------------------------------------------
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  const btn = document.getElementById("theme-toggle-btn");
+  if (btn) btn.textContent = theme === "light" ? "☀️" : "🌙";
+  try { localStorage.setItem("rr_theme", theme); } catch (e) {}
+}
 
-import bcrypt
-import jwt
-import requests
-from flask import Flask, request, jsonify, Response, stream_with_context, redirect
-from flask_cors import CORS
+document.addEventListener("DOMContentLoaded", () => {
+  const current = document.documentElement.getAttribute("data-theme") || "dark";
+  applyTheme(current);
+  const toggleBtn = document.getElementById("theme-toggle-btn");
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", () => {
+      const now = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+      applyTheme(now);
+    });
+  }
+});
 
-import drive_helpers as dh
-import facebook as fb
-import store
-import scheduler_core
-import media_token
+// ---------------------------------------------------------------
+// GENERIC PROMPT / CONFIRM MODAL — replaces native browser popups
+// ---------------------------------------------------------------
+function showPrompt({ title, placeholder = "", defaultValue = "", confirmLabel = "Save" }) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById("generic-modal");
+    const input = document.getElementById("generic-modal-input");
+    const msg = document.getElementById("generic-modal-message");
+    const confirmBtn = document.getElementById("generic-modal-confirm");
+    const cancelBtn = document.getElementById("generic-modal-cancel");
 
-app = Flask(__name__)
+    document.getElementById("generic-modal-title").textContent = title;
+    msg.hidden = true;
+    input.hidden = false;
+    input.placeholder = placeholder;
+    input.value = defaultValue;
+    confirmBtn.textContent = confirmLabel;
+    confirmBtn.classList.remove("btn-danger-solid");
+    modal.hidden = false;
+    setTimeout(() => { input.focus(); input.select(); }, 60);
 
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}}, supports_credentials=False)
-
-JWT_SECRET = os.environ["JWT_SECRET"]
-GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
-GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
-import json as _json
-USERS = _json.loads(os.environ.get("APP_USERS_JSON", "{}"))
-
-FACEBOOK_APP_ID = os.environ.get("FACEBOOK_APP_ID", "")
-FACEBOOK_APP_SECRET = os.environ.get("FACEBOOK_APP_SECRET", "")
-FACEBOOK_REDIRECT_URI = os.environ.get("FACEBOOK_REDIRECT_URI", "")
-SCHEDULER_SECRET = os.environ.get("SCHEDULER_SECRET", "")
-
-// # Short-lived cache: state token -> list of pages the user just granted
-// # access to, while they pick which one to link (a few minutes is plenty).
-_pending_fb_pages = {}
-
-
-// # ---------------------------------------------------------------
-// # AUTH HELPERS
-// # ---------------------------------------------------------------
-def make_jwt(username):
-    payload = {"u": username, "exp": datetime.datetime.utcnow() + datetime.timedelta(days=14)}
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-
-def current_username():
-    auth = request.headers.get("Authorization", "")
-    token = auth[len("Bearer "):] if auth.startswith("Bearer ") else request.args.get("token", "")
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload.get("u")
-    except jwt.PyJWTError:
-        return None
-
-
-def require_user():
-    username = current_username()
-    if not username or username not in USERS:
-        return None
-    return username
-
-
-def drive_headers(username):
-    return {"Authorization": f"Bearer {dh.get_access_token(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)}"}
-
-
-// # ---------------------------------------------------------------
-// # EXISTING ROUTES — Drive proxy (unchanged behavior)
-// # ---------------------------------------------------------------
-@app.route("/api/login", methods=["POST"])
-def login():
-    body = request.get_json(force=True, silent=True) or {}
-    username = (body.get("username") or "").strip()
-    password = body.get("password") or ""
-    user = USERS.get(username)
-    if not user:
-        return jsonify({"error": "Invalid username or password"}), 401
-    if not bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
-        return jsonify({"error": "Invalid username or password"}), 401
-    return jsonify({"token": make_jwt(username)})
-
-
-@app.route("/api/bootstrap", methods=["GET"])
-def bootstrap():
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    ids = dh.get_folder_ids(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
-    data = dh.load_data(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ids["dataFileId"])
-    return jsonify({**ids, "data": data})
-
-
-@app.route("/api/data", methods=["PUT"])
-def save_data_route():
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    ids = dh.get_folder_ids(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
-    body = request.get_json(force=True)
-    dh.save_data(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ids["dataFileId"], body)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/upload", methods=["POST"])
-def upload():
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    ids = dh.get_folder_ids(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
-    target = request.form.get("target", "pending")
-    folder_id = ids["uploadedFolderId"] if target == "uploaded" else ids["pendingFolderId"]
-
-    f = request.files["file"]
-    metadata = {"name": f"{int(time.time()*1000)}_{f.filename}", "parents": [folder_id]}
-    files_payload = {
-        "metadata": (None, _json.dumps(metadata), "application/json"),
-        "file": (f.filename, f.stream, f.mimetype),
+    function cleanup() {
+      modal.hidden = true;
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onKey);
     }
-    r = requests.post(
-        f"{dh.DRIVE_UPLOAD}?uploadType=multipart&fields=id,mimeType",
-        headers=drive_headers(username), files=files_payload,
-    )
-    r.raise_for_status()
-    return jsonify(r.json())
+    function onConfirm() { const v = input.value.trim(); cleanup(); resolve(v || null); }
+    function onCancel() { cleanup(); resolve(null); }
+    function onKey(e) { if (e.key === "Enter") onConfirm(); if (e.key === "Escape") onCancel(); }
 
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+    input.addEventListener("keydown", onKey);
+  });
+}
 
-@app.route("/api/move", methods=["POST"])
-def move_file_route():
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    ids = dh.get_folder_ids(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
-    body = request.get_json(force=True)
-    to_uploaded = bool(body.get("toUploaded"))
-    to_id = ids["uploadedFolderId"] if to_uploaded else ids["pendingFolderId"]
-    from_id = ids["pendingFolderId"] if to_uploaded else ids["uploadedFolderId"]
-    dh.move_file(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, body["fileId"], from_id, to_id)
-    return jsonify({"ok": True})
+function showConfirm({ title, message, danger = false, confirmLabel }) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById("generic-modal");
+    const input = document.getElementById("generic-modal-input");
+    const msg = document.getElementById("generic-modal-message");
+    const confirmBtn = document.getElementById("generic-modal-confirm");
+    const cancelBtn = document.getElementById("generic-modal-cancel");
 
+    document.getElementById("generic-modal-title").textContent = title;
+    msg.textContent = message;
+    msg.hidden = false;
+    input.hidden = true;
+    confirmBtn.textContent = confirmLabel || (danger ? "Delete" : "Confirm");
+    confirmBtn.classList.toggle("btn-danger-solid", danger);
+    modal.hidden = false;
 
-@app.route("/api/file/<file_id>", methods=["DELETE"])
-def delete_file(file_id):
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    requests.delete(f"{dh.DRIVE_FILES}/{file_id}", headers=drive_headers(username))
-    return jsonify({"ok": True})
+    function cleanup() {
+      modal.hidden = true;
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      confirmBtn.classList.remove("btn-danger-solid");
+    }
+    function onConfirm() { cleanup(); resolve(true); }
+    function onCancel() { cleanup(); resolve(false); }
 
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+  });
+}
 
-@app.route("/api/file/<file_id>", methods=["GET"])
-def get_file(file_id):
-    username = current_username()
-    if not username or username not in USERS:
-        return jsonify({"error": "Unauthorized"}), 401
-    upstream = requests.get(f"{dh.DRIVE_FILES}/{file_id}", headers=drive_headers(username), params={"alt": "media"}, stream=True)
-    return Response(
-        stream_with_context(upstream.iter_content(chunk_size=65536)),
-        content_type=upstream.headers.get("Content-Type", "application/octet-stream"),
-    )
+const DRIVE_FILES = "https://www.googleapis.com/drive/v3/files";
+const DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files";
 
+const state = {
+  authMode: null,       // "google" | "backend"
+  tokenClient: null,
+  accessToken: null,    // used in "google" mode
+  backendJwt: null,     // used in "backend" mode
+  folderId: null,
+  pendingFolderId: null,
+  uploadedFolderId: null,
+  dataFileId: null,
+  data: { pages: [] },
+  currentPageId: null,
+  currentTab: "ideas",
+  saveTimer: null,
+  blobCache: new Map(),
+};
 
-@app.route("/api/public/media/<file_id>", methods=["GET"])
-def public_media(file_id):
-    """Facebook's servers fetch the actual video/photo bytes from here.
-    Protected by a signed, short-lived token (not a login) — Facebook
-    can't send an Authorization header, so this can't require a JWT."""
-    result = media_token.verify_media_token(request.args.get("token", ""), expected_file_id=file_id)
-    if not result:
-        return jsonify({"error": "Invalid or expired link"}), 403
-    username, _ = result
-    upstream = requests.get(
-        f"{dh.DRIVE_FILES}/{file_id}", headers=drive_headers(username),
-        params={"alt": "media"}, stream=True,
-    )
-    return Response(
-        stream_with_context(upstream.iter_content(chunk_size=65536)),
-        content_type=upstream.headers.get("Content-Type", "application/octet-stream"),
-    )
+// ---------------------------------------------------------------
+// AUTH — Google (direct) mode
+// ---------------------------------------------------------------
+window.addEventListener("load", () => {
+  if (!window.google || !google.accounts) {
+    toast("Google sign-in script failed to load. Check your connection.", "error");
+    return;
+  }
+  state.tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CONFIG.CLIENT_ID,
+    scope: CONFIG.DRIVE_SCOPE,
+    callback: onTokenReceived,
+  });
 
+  document.getElementById("google-signin-btn").addEventListener("click", () => {
+    state.isSilentAttempt = false;
+    state.tokenClient.requestAccessToken({ prompt: "consent" });
+  });
 
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True})
+  // Restricted-PC login toggle
+  document.getElementById("show-id-login-btn").addEventListener("click", () => {
+    document.getElementById("id-login-form").hidden = false;
+  });
+  document.getElementById("back-to-google-btn").addEventListener("click", () => {
+    document.getElementById("id-login-form").hidden = true;
+  });
+  document.getElementById("id-login-btn").addEventListener("click", backendLogin);
 
+  // Resume an existing session on reload, whichever mode it was
+  const savedMode = localStorage.getItem("rr_auth_mode");
+  if (savedMode === "backend" && localStorage.getItem("rr_backend_jwt")) {
+    state.authMode = "backend";
+    state.backendJwt = localStorage.getItem("rr_backend_jwt");
+    enterApp();
+  } else if (localStorage.getItem("rr_logged_in") === "1") {
+    // Try a silent re-login if the browser remembers this Google session.
+    state.isSilentAttempt = true;
+    state.tokenClient.requestAccessToken({ prompt: "" });
+  }
+});
 
-// # ---------------------------------------------------------------
-// # NEW ROUTES — Facebook Page connection
-// # ---------------------------------------------------------------
-@app.route("/api/facebook/connect-url", methods=["GET"])
-def facebook_connect_url():
-    """Frontend opens this in a new tab. state = '<username>:<internalPageId>'."""
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    internal_page_id = request.args.get("pageId", "")
-    state = f"{username}:{internal_page_id}"
-    url = fb.build_login_url(FACEBOOK_APP_ID, FACEBOOK_REDIRECT_URI, state)
-    return jsonify({"url": url})
+async function onTokenReceived(resp) {
+  if (resp.error) {
+    // A failed silent attempt just means: show the normal login screen,
+    // no need to alarm the user with an error toast.
+    if (!state.isSilentAttempt) toast("Sign-in failed: " + resp.error, "error");
+    return;
+  }
+  state.authMode = "google";
+  state.accessToken = resp.access_token;
+  localStorage.setItem("rr_logged_in", "1");
+  localStorage.setItem("rr_auth_mode", "google");
+  await fetchAccountInfo();
+  enterApp();
+}
 
+async function fetchAccountInfo() {
+  try {
+    const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+      headers: { Authorization: `Bearer ${state.accessToken}` },
+    });
+    const info = await r.json();
+    document.getElementById("account-name").textContent = info.name || info.email || "Signed in";
+    if (info.picture) document.getElementById("account-avatar").src = info.picture;
+  } catch (e) { /* non-critical */ }
+}
 
-@app.route("/api/facebook/callback", methods=["GET"])
-def facebook_callback():
-    """Facebook redirects here after the user approves access. We fetch
-    their Pages and show a plain HTML picker (this runs in the popped-up
-    tab, outside the main single-page app)."""
-    code = request.args.get("code")
-    state = request.args.get("state", "")
-    username, _, internal_page_id = state.partition(":")
+// ---------------------------------------------------------------
+// AUTH — Backend (ID & Password) mode, for restricted PCs
+// ---------------------------------------------------------------
+async function backendLogin() {
+  const username = document.getElementById("id-username").value.trim();
+  const password = document.getElementById("id-password").value;
+  if (!username || !password) { toast("Enter your username and password.", "error"); return; }
+  if (!CONFIG.BACKEND_URL) { toast("Backend URL is not configured yet.", "error"); return; }
 
-    short_token = fb.exchange_code_for_user_token(FACEBOOK_APP_ID, FACEBOOK_APP_SECRET, FACEBOOK_REDIRECT_URI, code)
-    long_token = fb.get_long_lived_user_token(FACEBOOK_APP_ID, FACEBOOK_APP_SECRET, short_token)
-    pages = fb.list_managed_pages(long_token)
+  const btn = document.getElementById("id-login-btn");
+  btn.disabled = true;
+  btn.textContent = "Logging in…";
+  try {
+    const res = await fetch(`${CONFIG.BACKEND_URL}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      toast(body.error || "Login failed.", "error");
+      return;
+    }
+    const body = await res.json();
+    state.authMode = "backend";
+    state.backendJwt = body.token;
+    localStorage.setItem("rr_backend_jwt", body.token);
+    localStorage.setItem("rr_auth_mode", "backend");
+    document.getElementById("account-name").textContent = username;
+    enterApp();
+  } catch (e) {
+    console.error(e);
+    toast("Could not reach the backend. Check the URL and try again.", "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Log in";
+  }
+}
 
-    _pending_fb_pages[state] = pages
+function enterApp() {
+  document.getElementById("login-screen").hidden = true;
+  document.getElementById("app").hidden = false;
+  bootstrapDrive();
+}
 
-    if not pages:
-        return "<h2>No Facebook Pages found for this account. Make sure you're an admin of the Page and try again.</h2>"
+document.getElementById("signout-btn").addEventListener("click", () => {
+  if (state.authMode === "google" && state.accessToken) {
+    google.accounts.oauth2.revoke(state.accessToken, () => {});
+  }
+  localStorage.removeItem("rr_logged_in");
+  localStorage.removeItem("rr_auth_mode");
+  localStorage.removeItem("rr_backend_jwt");
+  location.reload();
+});
 
-    rows = "".join(
-        f"""<form method="POST" action="/api/facebook/select-page" style="margin:8px 0;">
-              <input type="hidden" name="state" value="{state}">
-              <input type="hidden" name="fbPageId" value="{p['id']}">
-              <button type="submit" style="padding:10px 16px;font-size:14px;">
-                Use "{p['name']}"
-              </button>
-            </form>"""
-        for p in pages
-    )
-    return f"""
-    <html><body style="font-family:sans-serif;max-width:480px;margin:60px auto;">
-      <h2>Choose a Facebook Page</h2>
-      <p>This will be linked to your Reel Room page.</p>
-      {rows}
-    </body></html>
-    """
+// ---------------------------------------------------------------
+// DRIVE BOOTSTRAP — dispatches to whichever mode is active
+// ---------------------------------------------------------------
+async function bootstrapDrive() {
+  setDriveStatus("Connecting…");
+  try {
+    if (state.authMode === "backend") {
+      const res = await backendFetch("/api/bootstrap");
+      const body = await res.json();
+      state.folderId = body.folderId;
+      state.pendingFolderId = body.pendingFolderId;
+      state.uploadedFolderId = body.uploadedFolderId;
+      state.dataFileId = body.dataFileId;
+      state.data = body.data;
+    } else {
+      state.folderId = await findOrCreateFolder(CONFIG.APP_FOLDER_NAME, "root");
+      state.pendingFolderId = await findOrCreateFolder("Pending Reels", state.folderId);
+      state.uploadedFolderId = await findOrCreateFolder("Uploaded Reels", state.folderId);
+      state.dataFileId = await findOrCreateDataFile();
+      state.data = await loadData();
+    }
+    if (!Array.isArray(state.data.pages)) state.data.pages = [];
+    setDriveStatus("Synced ✓");
+    renderPageList();
+    renderCurrentView();
+  } catch (e) {
+    console.error(e);
+    setDriveStatus("Connection failed", true);
+    toast("Could not load your data. Try refreshing.", "error");
+  }
+}
 
+function setDriveStatus(text, isError) {
+  const el = document.getElementById("drive-status");
+  el.textContent = text;
+  el.classList.toggle("err", !!isError);
+}
 
-@app.route("/api/facebook/select-page", methods=["POST"])
-def facebook_select_page():
-    state = request.form.get("state", "")
-    fb_page_id = request.form.get("fbPageId", "")
-    username, _, internal_page_id = state.partition(":")
+// ---------------------------------------------------------------
+// Backend proxy fetch (restricted-PC mode) — talks ONLY to our own
+// server; the browser here never contacts google.com.
+// ---------------------------------------------------------------
+async function backendFetch(path, options = {}) {
+  const res = await fetch(`${CONFIG.BACKEND_URL}${path}`, {
+    ...options,
+    headers: { Authorization: `Bearer ${state.backendJwt}`, ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Backend API ${res.status}: ${body}`);
+  }
+  return res;
+}
 
-    pages = _pending_fb_pages.get(state, [])
-    chosen = next((p for p in pages if p["id"] == fb_page_id), None)
-    if not chosen:
-        return "<h2>Something went wrong — that page selection expired. Please try connecting again.</h2>"
+// ---------------------------------------------------------------
+// Google Drive direct fetch (Google-login mode)
+// ---------------------------------------------------------------
+async function driveFetch(url, options = {}) {
+  const res = await fetch(url, {
+    ...options,
+    headers: { Authorization: `Bearer ${state.accessToken}`, ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Drive API ${res.status}: ${body}`);
+  }
+  return res;
+}
 
-    store.set_link(username, internal_page_id, chosen["id"], chosen["name"], chosen["access_token"])
-    _pending_fb_pages.pop(state, None)
-    return "<h2>Linked! You can close this tab and go back to Reel Room.</h2>"
+async function findOrCreateFolder(name, parentId) {
+  const q = encodeURIComponent(
+    `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`
+  );
+  const res = await driveFetch(`${DRIVE_FILES}?q=${q}&fields=files(id,name)`);
+  const json = await res.json();
+  if (json.files && json.files.length) return json.files[0].id;
 
+  const createRes = await driveFetch(DRIVE_FILES, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, mimeType: "application/vnd.google-apps.folder", parents: [parentId] }),
+  });
+  const created = await createRes.json();
+  return created.id;
+}
 
-@app.route("/api/facebook/status", methods=["GET"])
-def facebook_status():
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    return jsonify(store.get_all_links(username))
+async function findOrCreateDataFile() {
+  const q = encodeURIComponent(
+    `name='${CONFIG.DATA_FILE_NAME}' and '${state.folderId}' in parents and trashed=false`
+  );
+  const res = await driveFetch(`${DRIVE_FILES}?q=${q}&fields=files(id,name)`);
+  const json = await res.json();
+  if (json.files && json.files.length) return json.files[0].id;
 
+  const metadata = { name: CONFIG.DATA_FILE_NAME, parents: [state.folderId], mimeType: "application/json" };
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("file", new Blob([JSON.stringify({ pages: [] })], { type: "application/json" }));
+  const createRes = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id`, {
+    method: "POST",
+    body: form,
+  });
+  const created = await createRes.json();
+  return created.id;
+}
 
-@app.route("/api/facebook/unlink", methods=["POST"])
-def facebook_unlink():
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    body = request.get_json(force=True)
-    store.remove_link(username, body["pageId"])
-    return jsonify({"ok": True})
+async function loadData() {
+  const res = await driveFetch(`${DRIVE_FILES}/${state.dataFileId}?alt=media`);
+  return await res.json();
+}
 
+// ---------------------------------------------------------------
+// SAVE — dispatches to whichever mode is active
+// ---------------------------------------------------------------
+function queueSave() {
+  setDriveStatus("Saving…");
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(saveDataNow, 700);
+}
 
-@app.route("/api/facebook/publish-now", methods=["POST"])
-def facebook_publish_now():
-    """Manual 'Publish Now' button — publishes one idea immediately,
-    reusing the same logic as the daily automation."""
-    username = require_user()
-    if not username:
-        return jsonify({"error": "Unauthorized"}), 401
-    body = request.get_json(force=True)
-    internal_page_id = body["pageId"]
-    idea_id = body["ideaId"]
+async function saveDataNow() {
+  try {
+    if (state.authMode === "backend") {
+      await backendFetch("/api/data", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state.data),
+      });
+    } else {
+      await driveFetch(`${DRIVE_UPLOAD}/${state.dataFileId}?uploadType=media`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state.data),
+      });
+    }
+    setDriveStatus("Synced ✓");
+  } catch (e) {
+    console.error(e);
+    setDriveStatus("Save failed — retrying…", true);
+    state.saveTimer = setTimeout(saveDataNow, 3000);
+  }
+}
 
-    link = store.get_link(username, internal_page_id)
-    if not link:
-        return jsonify({"error": "This page isn't linked to a Facebook Page yet."}), 400
+// ---------------------------------------------------------------
+// MEDIA — upload / move / delete / preview, dispatched by mode
+// isUploadedTarget: true = goes to "Uploaded Reels", false = "Pending Reels"
+// ---------------------------------------------------------------
+async function uploadMedia(file, isUploadedTarget) {
+  if (state.authMode === "backend") {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("target", isUploadedTarget ? "uploaded" : "pending");
+    const res = await backendFetch("/api/upload", { method: "POST", body: form });
+    return await res.json();
+  }
+  const folderId = isUploadedTarget ? state.uploadedFolderId : state.pendingFolderId;
+  const metadata = { name: `${Date.now()}_${file.name}`, parents: [folderId] };
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("file", file);
+  const res = await driveFetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id,mimeType`, {
+    method: "POST",
+    body: form,
+  });
+  return await res.json(); // {id, mimeType}
+}
 
-    ids = dh.get_folder_ids(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
-    data = dh.load_data(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ids["dataFileId"])
-    page = next((p for p in data["pages"] if p["id"] == internal_page_id), None)
-    idea = next((i for i in page["ideas"] if i["id"] == idea_id), None) if page else None
-    if not idea:
-        return jsonify({"error": "Idea not found."}), 404
+async function moveFileBetweenFolders(fileId, fromFolderId, toFolderId) {
+  if (!fileId) return;
+  try {
+    await driveFetch(
+      `${DRIVE_FILES}/${fileId}?addParents=${toFolderId}&removeParents=${fromFolderId}&fields=id,parents`,
+      { method: "PATCH" }
+    );
+  } catch (e) {
+    console.error("Could not move file in Drive:", e);
+  }
+}
 
-    try:
-        scheduler_core.publish_idea(username, ids, link, idea)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+async function moveIdeaMedia(idea, toUploaded) {
+  if (state.authMode === "backend") {
+    for (const fileId of [idea.thumbFileId, idea.videoFileId]) {
+      if (!fileId) continue;
+      try {
+        await backendFetch("/api/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileId, toUploaded }),
+        });
+      } catch (e) { console.error(e); }
+    }
+    return;
+  }
+  const from = toUploaded ? state.pendingFolderId : state.uploadedFolderId;
+  const to = toUploaded ? state.uploadedFolderId : state.pendingFolderId;
+  await Promise.all([
+    moveFileBetweenFolders(idea.thumbFileId, from, to),
+    moveFileBetweenFolders(idea.videoFileId, from, to),
+  ]);
+}
 
-    dh.save_data(username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ids["dataFileId"], data)
-    return jsonify({"ok": True})
+async function deleteFile(fileId) {
+  if (!fileId) return;
+  try {
+    if (state.authMode === "backend") {
+      await backendFetch(`/api/file/${fileId}`, { method: "DELETE" });
+    } else {
+      await driveFetch(`${DRIVE_FILES}/${fileId}`, { method: "DELETE" });
+    }
+  } catch (e) { /* ignore */ }
+}
 
+async function getImageBlobUrl(fileId) {
+  if (state.blobCache.has(fileId)) return state.blobCache.get(fileId);
+  const res = state.authMode === "backend"
+    ? await backendFetch(`/api/file/${fileId}`)
+    : await driveFetch(`${DRIVE_FILES}/${fileId}?alt=media`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  state.blobCache.set(fileId, url);
+  return url;
+}
 
-@app.route("/api/scheduler/run", methods=["GET", "POST"])
-def scheduler_run():
-    """Pinged by free external cron services (cron-job.org). Protected by
-    a shared secret so nobody else can trigger it.
-    - Default (no mode param): time-precise check, runs every 15-30 min.
-    - ?mode=safety: end-of-day catch-all, ignores each idea's time field.
-      Run this one once a day, late at night, as a second cron-job.org job
-      (replaces PythonAnywhere's Scheduled Tasks, which are no longer free)."""
-    if not SCHEDULER_SECRET or request.args.get("secret") != SCHEDULER_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-    force_all = request.args.get("mode") == "safety"
-    log = scheduler_core.run_check(force_all=force_all)
-    return jsonify({"ok": True, "log": log})
+// ---------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------
+function uid() {
+  return (crypto.randomUUID ? crypto.randomUUID() : "id-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+}
+function codePrefix(name) {
+  const letters = name.replace(/[^a-zA-Z]/g, "").toUpperCase();
+  return (letters.slice(0, 2) || "PG");
+}
+function currentPage() {
+  return state.data.pages.find((p) => p.id === state.currentPageId) || null;
+}
+async function showVideoPreview(fileId) {
+  try {
+    const url = await getImageBlobUrl(fileId);
+    document.getElementById("video-modal-player").src = url;
+    document.getElementById("video-modal").hidden = false;
+  } catch (e) {
+    console.error(e);
+    toast("Could not load this video.", "error");
+  }
+}
 
+document.getElementById("video-modal-close").addEventListener("click", () => {
+  const player = document.getElementById("video-modal-player");
+  player.pause();
+  player.src = "";
+  document.getElementById("video-modal").hidden = true;
+});
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+function toast(msg, type) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = "toast" + (type ? " " + type : "");
+  el.hidden = false;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => (el.hidden = true), 3200);
+}
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---------------------------------------------------------------
+// PAGE LIST / SIDEBAR
+// ---------------------------------------------------------------
+document.getElementById("add-page-btn").addEventListener("click", async () => {
+  const name = await showPrompt({ title: "Name this Facebook page", placeholder: "e.g. Crash Craze", confirmLabel: "Add page" });
+  if (!name) return;
+  const page = {
+    id: uid(),
+    name: name.trim(),
+    codePrefix: codePrefix(name.trim()),
+    masterPrompt: "",
+    ideaCounter: 0,
+    ideas: [],
+    customTables: [],
+  };
+  state.data.pages.push(page);
+  state.currentPageId = page.id;
+  queueSave();
+  renderPageList();
+  renderCurrentView();
+});
+
+function renderPageList() {
+  const wrap = document.getElementById("page-list");
+  wrap.innerHTML = "";
+  state.data.pages.forEach((page) => {
+    const div = document.createElement("div");
+    div.className = "page-card" + (page.id === state.currentPageId ? " active" : "");
+    const pending = page.ideas.filter((i) => !i.uploaded).length;
+    div.innerHTML = `
+      <div class="page-avatar">${escapeHtml(page.name.slice(0, 2).toUpperCase())}</div>
+      <div class="page-card-info">
+        <div class="page-card-name">${escapeHtml(page.name)}</div>
+        <div class="page-card-meta">${pending} pending</div>
+      </div>`;
+    div.addEventListener("click", () => {
+      state.currentPageId = page.id;
+      renderPageList();
+      renderCurrentView();
+      document.getElementById("sidebar").classList.remove("open");
+    });
+    wrap.appendChild(div);
+  });
+}
+
+document.getElementById("sidebar-toggle").addEventListener("click", () => {
+  document.getElementById("sidebar").classList.toggle("open");
+});
+
+document.getElementById("rename-page-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const name = await showPrompt({ title: "Rename page", defaultValue: page.name, confirmLabel: "Save" });
+  if (!name) return;
+  page.name = name;
+  queueSave();
+  renderPageList();
+  renderCurrentView();
+});
+
+document.getElementById("delete-page-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const ok = await showConfirm({
+    title: "Delete this page?",
+    message: `"${page.name}" and all its ideas will be permanently deleted. This can't be undone.`,
+    danger: true,
+  });
+  if (!ok) return;
+  state.data.pages = state.data.pages.filter((p) => p.id !== page.id);
+  state.currentPageId = null;
+  queueSave();
+  renderPageList();
+  renderCurrentView();
+});
+
+// ---------------------------------------------------------------
+// TABS
+// ---------------------------------------------------------------
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    state.currentTab = btn.dataset.tab;
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".tab-panel").forEach((p) => (p.hidden = true));
+    document.getElementById("tab-" + btn.dataset.tab).hidden = false;
+    if (btn.dataset.tab === "uploaded") renderUploadedTable();
+    if (btn.dataset.tab === "tables") renderCustomTables();
+    if (btn.dataset.tab === "automation") renderAutomationTab();
+  });
+});
+
+// ---------------------------------------------------------------
+// MAIN RENDER
+// ---------------------------------------------------------------
+function renderCurrentView() {
+  const page = currentPage();
+  document.getElementById("empty-state").hidden = !!page;
+  document.getElementById("page-view").hidden = !page;
+  if (!page) return;
+
+  document.getElementById("page-title-display").textContent = page.name;
+  document.getElementById("master-prompt-input").value = page.masterPrompt || "";
+  if (!page.customTables) page.customTables = [];
+  renderIdeasTable();
+  renderUploadedTable();
+  renderCustomTables();
+}
+
+function renderIdeasTable() {
+  const page = currentPage();
+  const tbody = document.getElementById("ideas-tbody");
+  tbody.innerHTML = "";
+  const pending = page.ideas.filter((i) => !i.uploaded);
+  document.getElementById("ideas-count").textContent = `${pending.length} idea${pending.length === 1 ? "" : "s"}`;
+  document.getElementById("ideas-empty").hidden = pending.length > 0;
+
+  pending.forEach((idea) => tbody.appendChild(buildIdeaRow(idea, page, false)));
+}
+
+function renderUploadedTable() {
+  const page = currentPage();
+  if (!page) return;
+  const tbody = document.getElementById("uploaded-tbody");
+  tbody.innerHTML = "";
+  const done = page.ideas.filter((i) => i.uploaded);
+  document.getElementById("uploaded-empty").hidden = done.length > 0;
+  done.forEach((idea) => tbody.appendChild(buildIdeaRow(idea, page, true)));
+}
+
+function buildIdeaRow(idea, page, isUploadedView) {
+  const tr = document.createElement("tr");
+  if (idea.uploaded) tr.classList.add("done");
+
+  const thumbCell = idea.thumbFileId
+    ? `<img class="thumb-thumbnail" data-thumb-id="${idea.thumbFileId}" alt="thumbnail">`
+    : `<div class="thumb-placeholder"></div>`;
+
+  const videoCell = idea.videoFileId
+    ? `<button type="button" class="video-link video-preview-btn" data-video-id="${idea.videoFileId}">▶ Preview</button>`
+    : `<span class="video-none">—</span>`;
+
+  tr.innerHTML = `
+    <td><span class="idea-code">${page.codePrefix}-${String(idea.code).padStart(3, "0")}</span></td>
+    <td class="idea-title">${escapeHtml(idea.title)}</td>
+    <td class="idea-desc" title="${escapeHtml(idea.description)}">${escapeHtml(idea.description) || "—"}</td>
+    <td class="idea-tags">${escapeHtml(idea.hashtags) || "—"}</td>
+    <td class="idea-date">${idea.date || "—"}</td>
+    <td class="idea-date">${idea.time || "—"}</td>
+    <td>${thumbCell}</td>
+    <td>${videoCell}</td>
+    ${isUploadedView ? "" : `<td class="col-done"><input type="checkbox" class="check-toggle" ${idea.uploaded ? "checked" : ""}></td>`}
+    <td class="row-actions">
+      ${!isUploadedView && state.authMode === "backend" ? `<button class="icon-btn publish-btn" title="Publish to Facebook now">📤</button>` : ""}
+      <button class="icon-btn edit-btn" title="Edit">✎</button>
+      <button class="icon-btn danger del-btn" title="Delete">🗑</button>
+    </td>`;
+
+  const img = tr.querySelector("[data-thumb-id]");
+  if (img) {
+    getImageBlobUrl(idea.thumbFileId).then((url) => (img.src = url)).catch(() => {});
+  }
+
+  const videoBtn = tr.querySelector("[data-video-id]");
+  if (videoBtn) {
+    videoBtn.addEventListener("click", () => showVideoPreview(idea.videoFileId));
+  }
+
+  const checkbox = tr.querySelector(".check-toggle");
+  if (checkbox) {
+    checkbox.addEventListener("change", async () => {
+      const newVal = checkbox.checked;
+      idea.uploaded = newVal;
+      idea.uploadedAt = newVal ? new Date().toISOString().slice(0, 10) : null;
+      queueSave();
+      renderIdeasTable();
+      renderUploadedTable();
+      renderPageList();
+      if (idea.thumbFileId || idea.videoFileId) {
+        setDriveStatus("Moving files in Drive…");
+        await moveIdeaMedia(idea, newVal);
+        setDriveStatus("Synced ✓");
+      }
+    });
+  }
+
+  tr.querySelector(".edit-btn").addEventListener("click", () => openIdeaModal(idea));
+
+  const publishBtn = tr.querySelector(".publish-btn");
+  if (publishBtn) {
+    publishBtn.addEventListener("click", async () => {
+      const ok = await showConfirm({ title: "Publish now?", message: `"${idea.title}" will be posted to your linked Facebook Page immediately.` });
+      if (!ok) return;
+      publishBtn.disabled = true;
+      try {
+        await backendFetch("/api/facebook/publish-now", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pageId: page.id, ideaId: idea.id }),
+        });
+        toast("Published to Facebook.", "success");
+        await bootstrapDrive();
+      } catch (e) {
+        console.error(e);
+        toast("Could not publish. Check the Automation tab is connected.", "error");
+      } finally {
+        publishBtn.disabled = false;
+      }
+    });
+  }
+  tr.querySelector(".del-btn").addEventListener("click", async () => {
+    const ok = await showConfirm({ title: "Delete this idea?", message: `"${idea.title}" will be permanently removed, along with its thumbnail and video.`, danger: true });
+    if (!ok) return;
+    await deleteFile(idea.thumbFileId);
+    await deleteFile(idea.videoFileId);
+    page.ideas = page.ideas.filter((i) => i.id !== idea.id);
+    queueSave();
+    renderIdeasTable();
+    renderUploadedTable();
+    renderPageList();
+  });
+
+  return tr;
+}
+
+// ---------------------------------------------------------------
+// MASTER PROMPT
+// ---------------------------------------------------------------
+document.getElementById("save-master-btn").addEventListener("click", () => {
+  const page = currentPage();
+  if (!page) return;
+  page.masterPrompt = document.getElementById("master-prompt-input").value;
+  queueSave();
+  const tag = document.getElementById("master-saved-tag");
+  tag.hidden = false;
+  setTimeout(() => (tag.hidden = true), 2000);
+});
+
+// ---------------------------------------------------------------
+// IDEA MODAL (add / edit)
+// ---------------------------------------------------------------
+let editingIdeaId = null;
+let pendingThumbFile = null;
+let pendingVideoFile = null;
+
+document.getElementById("add-idea-btn").addEventListener("click", () => openIdeaModal(null));
+document.getElementById("modal-cancel").addEventListener("click", closeIdeaModal);
+
+function openIdeaModal(idea) {
+  editingIdeaId = idea ? idea.id : null;
+  pendingThumbFile = null;
+  pendingVideoFile = null;
+  document.getElementById("modal-title").textContent = idea ? "Edit idea" : "New idea";
+  document.getElementById("f-title").value = idea ? idea.title : "";
+  document.getElementById("f-desc").value = idea ? idea.description : "";
+  document.getElementById("f-hashtags").value = idea ? idea.hashtags : "";
+  document.getElementById("f-date").value = idea ? idea.date || "" : "";
+  document.getElementById("f-time").value = idea ? idea.time || "" : "";
+  document.getElementById("f-thumb").value = "";
+  document.getElementById("f-video").value = "";
+  document.getElementById("upload-progress").hidden = true;
+
+  const thumbPrev = document.getElementById("thumb-preview");
+  const videoPrev = document.getElementById("video-preview");
+  thumbPrev.hidden = true;
+  videoPrev.hidden = true;
+  if (idea && idea.thumbFileId) {
+    getImageBlobUrl(idea.thumbFileId).then((url) => {
+      thumbPrev.innerHTML = `<img src="${url}"><div class="file-name">Current thumbnail (choose a file to replace)</div>`;
+      thumbPrev.hidden = false;
+    });
+  }
+  if (idea && idea.videoFileId) {
+    videoPrev.innerHTML = `<div class="file-name">Current video is saved (choose a file to replace)</div>`;
+    videoPrev.hidden = false;
+  }
+
+  document.getElementById("idea-modal").hidden = false;
+}
+
+function closeIdeaModal() {
+  document.getElementById("idea-modal").hidden = true;
+  editingIdeaId = null;
+}
+
+document.getElementById("f-thumb").addEventListener("change", (e) => {
+  pendingThumbFile = e.target.files[0] || null;
+  const prev = document.getElementById("thumb-preview");
+  if (!pendingThumbFile) { prev.hidden = true; return; }
+  const reader = new FileReader();
+  reader.onload = () => {
+    prev.innerHTML = `<img src="${reader.result}"><div class="file-name">${escapeHtml(pendingThumbFile.name)}</div>`;
+    prev.hidden = false;
+  };
+  reader.readAsDataURL(pendingThumbFile);
+});
+
+document.getElementById("f-video").addEventListener("change", (e) => {
+  pendingVideoFile = e.target.files[0] || null;
+  const prev = document.getElementById("video-preview");
+  if (!pendingVideoFile) { prev.hidden = true; return; }
+  const sizeMb = (pendingVideoFile.size / (1024 * 1024)).toFixed(1);
+  prev.innerHTML = `<div class="file-name">${escapeHtml(pendingVideoFile.name)} (${sizeMb} MB)</div>`;
+  prev.hidden = false;
+});
+
+document.getElementById("modal-save").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const title = document.getElementById("f-title").value.trim();
+  if (!title) { toast("Give the idea a title first.", "error"); return; }
+
+  const progress = document.getElementById("upload-progress");
+  const saveBtn = document.getElementById("modal-save");
+  saveBtn.disabled = true;
+
+  try {
+    let idea = editingIdeaId ? page.ideas.find((i) => i.id === editingIdeaId) : null;
+    const isNew = !idea;
+    if (isNew) {
+      page.ideaCounter += 1;
+      idea = { id: uid(), code: page.ideaCounter, uploaded: false, thumbFileId: null, videoFileId: null, videoLink: null };
+      page.ideas.push(idea);
+    }
+
+    idea.title = title;
+    idea.description = document.getElementById("f-desc").value.trim();
+    idea.hashtags = document.getElementById("f-hashtags").value.trim();
+    idea.date = document.getElementById("f-date").value;
+
+    idea.time = document.getElementById("f-time").value;
+
+    if (pendingThumbFile) {
+      progress.hidden = false;
+      progress.textContent = "Uploading thumbnail…";
+      if (idea.thumbFileId) await deleteFile(idea.thumbFileId);
+      const uploaded = await uploadMedia(pendingThumbFile, idea.uploaded);
+      idea.thumbFileId = uploaded.id;
+      state.blobCache.delete(uploaded.id);
+    }
+    if (pendingVideoFile) {
+      progress.hidden = false;
+      progress.textContent = "Uploading video…";
+      if (idea.videoFileId) await deleteFile(idea.videoFileId);
+      const uploaded = await uploadMedia(pendingVideoFile, idea.uploaded);
+      idea.videoFileId = uploaded.id;
+      state.blobCache.delete(uploaded.id);
+    }
+
+    queueSave();
+    closeIdeaModal();
+    renderIdeasTable();
+    renderUploadedTable();
+    renderPageList();
+    toast("Idea saved.", "success");
+  } catch (e) {
+    console.error(e);
+    toast("Something went wrong saving this idea.", "error");
+  } finally {
+    saveBtn.disabled = false;
+    progress.hidden = true;
+  }
+});
+
+// ---------------------------------------------------------------
+// CUSTOM TABLES — fully user-defined headings & content
+// Each row has a "Used" checkbox — ticking it draws a strikethrough
+// through that row's content (mirrors the Ideas -> Uploaded pattern).
+// ---------------------------------------------------------------
+document.getElementById("add-table-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const name = await showPrompt({ title: "Name this table", defaultValue: "Untitled Table", confirmLabel: "Create table" });
+  if (!name) return;
+  if (!page.customTables) page.customTables = [];
+  const table = {
+    id: uid(),
+    name,
+    columns: [
+      { id: uid(), label: "Column 1" },
+      { id: uid(), label: "Column 2" },
+    ],
+    rows: [],
+  };
+  page.customTables.push(table);
+  queueSave();
+  renderCustomTables();
+});
+
+function renderCustomTables() {
+  const page = currentPage();
+  const wrap = document.getElementById("custom-tables-list");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  if (!page) return;
+  if (!page.customTables) page.customTables = [];
+  if (!page.customTables.length) {
+    wrap.innerHTML = `<div class="table-empty">No custom tables yet — click "+ New table" above to build one.</div>`;
+    return;
+  }
+  page.customTables.forEach((table) => wrap.appendChild(buildCustomTableCard(table, page)));
+}
+
+function buildCustomTableCard(table, page) {
+  const card = document.createElement("div");
+  card.className = "custom-table-card";
+
+  const header = document.createElement("div");
+  header.className = "custom-table-header";
+  header.innerHTML = `
+    <input class="custom-table-name" value="${escapeHtml(table.name)}" title="Table name">
+    <div class="custom-table-actions">
+      <button class="btn-ghost add-col-btn">+ Column</button>
+      <button class="btn-ghost add-row-btn">+ Row</button>
+      <button class="icon-btn danger del-table-btn" title="Delete this table">🗑</button>
+    </div>`;
+  card.appendChild(header);
+
+  header.querySelector(".custom-table-name").addEventListener("change", (e) => {
+    table.name = e.target.value.trim() || "Untitled Table";
+    queueSave();
+  });
+  header.querySelector(".add-col-btn").addEventListener("click", async () => {
+    const label = await showPrompt({ title: "New column heading", defaultValue: "New Column", confirmLabel: "Add column" });
+    if (!label) return;
+    const col = { id: uid(), label };
+    table.columns.push(col);
+    table.rows.forEach((r) => (r.cells[col.id] = ""));
+    queueSave();
+    renderCustomTables();
+  });
+  header.querySelector(".add-row-btn").addEventListener("click", () => {
+    const cells = {};
+    table.columns.forEach((c) => (cells[c.id] = ""));
+    table.rows.push({ id: uid(), cells, done: false });
+    queueSave();
+    renderCustomTables();
+  });
+  header.querySelector(".del-table-btn").addEventListener("click", async () => {
+    const ok = await showConfirm({ title: "Delete this table?", message: `"${table.name}" and everything in it will be permanently deleted.`, danger: true });
+    if (!ok) return;
+    page.customTables = page.customTables.filter((t) => t.id !== table.id);
+    queueSave();
+    renderCustomTables();
+  });
+
+  const tableWrap = document.createElement("div");
+  tableWrap.className = "table-wrap";
+  const tableEl = document.createElement("table");
+  tableEl.className = "reel-table custom-table";
+
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  table.columns.forEach((col) => {
+    const th = document.createElement("th");
+    th.innerHTML = `<div class="col-head">
+        <input class="col-label-input" value="${escapeHtml(col.label)}">
+        <button class="col-del-btn" title="Remove this column">×</button>
+      </div>`;
+    th.querySelector(".col-label-input").addEventListener("change", (e) => {
+      col.label = e.target.value.trim() || "Column";
+      queueSave();
+    });
+    th.querySelector(".col-del-btn").addEventListener("click", async () => {
+      if (table.columns.length <= 1) { toast("A table needs at least one column.", "error"); return; }
+      const ok = await showConfirm({ title: "Remove this column?", message: `"${col.label}" will be removed from every row.`, danger: true });
+      if (!ok) return;
+      table.columns = table.columns.filter((c) => c.id !== col.id);
+      table.rows.forEach((r) => delete r.cells[col.id]);
+      queueSave();
+      renderCustomTables();
+    });
+    headRow.appendChild(th);
+  });
+  const usedTh = document.createElement("th");
+  usedTh.className = "col-done";
+  usedTh.textContent = "Used";
+  headRow.appendChild(usedTh);
+  headRow.appendChild(document.createElement("th")).className = "col-actions";
+  thead.appendChild(headRow);
+  tableEl.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  if (!table.rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = table.columns.length + 2;
+    td.className = "table-empty";
+    td.textContent = 'No rows yet — click "+ Row" above to add one.';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  } else {
+    table.rows.forEach((row) => {
+      const tr = document.createElement("tr");
+      if (row.done) tr.classList.add("done");
+
+      table.columns.forEach((col) => {
+        const td = document.createElement("td");
+        const cellInput = document.createElement("textarea");
+        cellInput.className = "cell-input";
+        cellInput.rows = 1;
+        cellInput.value = row.cells[col.id] || "";
+        cellInput.addEventListener("input", () => {
+          cellInput.style.height = "auto";
+          cellInput.style.height = cellInput.scrollHeight + "px";
+        });
+        cellInput.addEventListener("change", (e) => {
+          row.cells[col.id] = e.target.value;
+          queueSave();
+        });
+        td.appendChild(cellInput);
+        tr.appendChild(td);
+      });
+
+      const usedTd = document.createElement("td");
+      usedTd.className = "col-done";
+      const usedCheckbox = document.createElement("input");
+      usedCheckbox.type = "checkbox";
+      usedCheckbox.className = "check-toggle";
+      usedCheckbox.checked = !!row.done;
+      usedCheckbox.addEventListener("change", () => {
+        row.done = usedCheckbox.checked;
+        queueSave();
+        tr.classList.toggle("done", row.done);
+      });
+      usedTd.appendChild(usedCheckbox);
+      tr.appendChild(usedTd);
+
+      const tdActions = document.createElement("td");
+      tdActions.className = "row-actions";
+      tdActions.innerHTML = `<button class="icon-btn danger del-row-btn" title="Delete row">🗑</button>`;
+      tdActions.querySelector(".del-row-btn").addEventListener("click", async () => {
+        const ok = await showConfirm({ title: "Delete this row?", message: "This row will be permanently removed.", danger: true });
+        if (!ok) return;
+        table.rows = table.rows.filter((r) => r.id !== row.id);
+        queueSave();
+        renderCustomTables();
+      });
+      tr.appendChild(tdActions);
+      tbody.appendChild(tr);
+    });
+  }
+  tableEl.appendChild(tbody);
+  tableWrap.appendChild(tableEl);
+  card.appendChild(tableWrap);
+  return card;
+}
+
+// ---------------------------------------------------------------
+// AUTOMATION TAB — link a Facebook Page, show status, connect/disconnect
+// ---------------------------------------------------------------
+async function renderAutomationTab() {
+  const page = currentPage();
+  if (!page) return;
+
+  const locked = document.getElementById("automation-locked");
+  const panel = document.getElementById("automation-panel");
+
+  if (state.authMode !== "backend") {
+    locked.hidden = false;
+    panel.hidden = true;
+    return;
+  }
+  locked.hidden = true;
+  panel.hidden = false;
+
+  const statusEl = document.getElementById("automation-status");
+  const connectBtn = document.getElementById("fb-connect-btn");
+  const unlinkBtn = document.getElementById("fb-unlink-btn");
+  statusEl.textContent = "Checking…";
+  unlinkBtn.hidden = true;
+
+  try {
+    const res = await backendFetch("/api/facebook/status");
+    const links = await res.json();
+    const link = links[page.id];
+    if (link) {
+      statusEl.textContent = `Connected to Facebook Page: "${link.fb_page_name}"`;
+      connectBtn.textContent = "Reconnect / change Page";
+      unlinkBtn.hidden = false;
+    } else {
+      statusEl.textContent = "Not connected yet.";
+      connectBtn.textContent = "Connect Facebook Page";
+    }
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = "Could not check connection status.";
+  }
+}
+
+document.getElementById("fb-connect-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  try {
+    const res = await backendFetch(`/api/facebook/connect-url?pageId=${encodeURIComponent(page.id)}`);
+    const body = await res.json();
+    window.open(body.url, "_blank");
+    toast("Finish connecting in the new tab, then come back and refresh this tab.");
+  } catch (e) {
+    console.error(e);
+    toast("Could not start Facebook connection.", "error");
+  }
+});
+
+document.getElementById("fb-unlink-btn").addEventListener("click", async () => {
+  const page = currentPage();
+  if (!page) return;
+  const ok = await showConfirm({ title: "Disconnect this Facebook Page?", message: "Automatic publishing for this page will stop until you reconnect." });
+  if (!ok) return;
+  try {
+    await backendFetch("/api/facebook/unlink", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pageId: page.id }),
+    });
+    toast("Disconnected.", "success");
+    renderAutomationTab();
+  } catch (e) {
+    console.error(e);
+    toast("Could not disconnect.", "error");
+  }
+});
