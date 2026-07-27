@@ -19,10 +19,12 @@ import datetime
 import drive_helpers as dh
 import facebook as fb
 import store
+import media_token
 
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 USERS = json.loads(os.environ.get("APP_USERS_JSON", "{}"))
+BACKEND_PUBLIC_URL = os.environ["BACKEND_PUBLIC_URL"]  # e.g. https://yourname.pythonanywhere.com
 
 PKT_OFFSET = datetime.timedelta(hours=5)
 
@@ -42,29 +44,26 @@ def is_due(idea, today_str, now_hm, force_all):
     return idea_time <= now_hm
 
 
+def media_url(username, file_id):
+    token = media_token.make_media_token(username, file_id)
+    return f"{BACKEND_PUBLIC_URL}/api/public/media/{file_id}?token={token}"
+
+
 def publish_idea(username, ids, link, idea):
-    args = (username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
     caption = " ".join(filter(None, [idea.get("title"), idea.get("description"), idea.get("hashtags")]))
 
     if idea.get("videoFileId"):
-        perm_id = dh.make_file_public(*args, idea["videoFileId"])
-        try:
-            url = dh.public_download_link(idea["videoFileId"])
-            fb.publish_reel(link["fb_page_id"], link["fb_page_token"], url, caption)
-        finally:
-            dh.revoke_public_permission(*args, idea["videoFileId"], perm_id)
+        url = media_url(username, idea["videoFileId"])
+        fb.publish_reel(link["fb_page_id"], link["fb_page_token"], url, caption)
     elif idea.get("thumbFileId"):
-        perm_id = dh.make_file_public(*args, idea["thumbFileId"])
-        try:
-            url = dh.public_download_link(idea["thumbFileId"])
-            fb.publish_photo(link["fb_page_id"], link["fb_page_token"], url, caption)
-        finally:
-            dh.revoke_public_permission(*args, idea["thumbFileId"], perm_id)
+        url = media_url(username, idea["thumbFileId"])
+        fb.publish_photo(link["fb_page_id"], link["fb_page_token"], url, caption)
     else:
         raise Exception("This idea has no video or thumbnail to publish.")
 
     idea["uploaded"] = True
     idea["uploadedAt"] = now_pkt().date().isoformat()
+    args = (username, USERS, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
     if idea.get("thumbFileId"):
         dh.move_file(*args, idea["thumbFileId"], ids["pendingFolderId"], ids["uploadedFolderId"])
     if idea.get("videoFileId"):
