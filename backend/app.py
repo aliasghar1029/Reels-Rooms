@@ -20,6 +20,7 @@
 import os
 import time
 import datetime
+import threading
 
 import bcrypt
 import jwt
@@ -325,13 +326,23 @@ def scheduler_run():
     a shared secret so nobody else can trigger it.
     - Default (no mode param): time-precise check, runs every 15-30 min.
     - ?mode=safety: end-of-day catch-all, ignores each idea's time field.
-      Run this one once a day, late at night, as a second cron-job.org job
-      (replaces PythonAnywhere's Scheduled Tasks, which are no longer free)."""
+
+    Publishing (downloading the video and uploading it to Facebook) can
+    take longer than cron-job.org's timeout allows, so this responds
+    IMMEDIATELY and does the actual work in a background thread — the
+    cron ping never has to wait for it to finish."""
     if not SCHEDULER_SECRET or request.args.get("secret") != SCHEDULER_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
     force_all = request.args.get("mode") == "safety"
-    log = scheduler_core.run_check(force_all=force_all)
-    return jsonify({"ok": True, "log": log})
+
+    def worker():
+        try:
+            scheduler_core.run_check(force_all=force_all)
+        except Exception as e:
+            print(f"Background scheduler run failed: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
 
 
 if __name__ == "__main__":
